@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # raspberrypi5_motor
 2학기 공통 프로젝트 모터 담당 라즈베리파이 5 세팅 과정
 =======
@@ -1127,4 +1126,3 @@ sudo systemctl status ssafy-motor.service
 
   * 길이4 강제 → `float()` 변환 → 채널별 0..MAX 클램프 → (옵션) 반올림 → 상태 보관
   * 내부 `60-θ` **반전 금지**(드라이버가 수행)
->>>>>>> f3ff463 (feat: initial commit (motor project: servo/peltier/fans/leds + scripts))
