@@ -1,0 +1,25 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+pytest_cache/
+.mypy_cache/
+.coverage
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Builds / Dist
+build/
+dist/
+
+# Project-specific
+backups/
+*.tar.gz
+arduino/*.hex
+EOF
