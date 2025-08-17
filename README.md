@@ -37,7 +37,7 @@
 15. [실행 로그 예시](#-실행-로그-예시)
 16. [주의사항](#주의사항)
 17. [부록 — 빠른 레퍼런스](#부록--빠른-레퍼런스)
-18. [버튼 기반 제어(SoftKill/LED/Power)](#버튼-기반-제어-SoftKill-LED-Power-)
+18. [버튼 기반 제어(SoftKill/LED/Power)](#버튼-기반-제어softkillledpower)
 19. [CLI (NO-MQTT) — main 로직 직접 시험](#CLI-NO-MQTT--main-로직-직접-시험)
 21. [변경 로그](#변경-로그)
 
