@@ -32,15 +32,14 @@
 10. [Config (`src/config.py`)](#config-srcconfigpy)
 11. [MQTT Client (`src/mqtt_client.py`)](#mqtt-client-srcmqtt_clientpy)
 12. [MQTT 파이프라인 예시](#mqtt-파이프라인-예시)
-13. [백업 및 복원](#백업-및-복원)
-14. [자동 실행 (systemd)](#자동-실행-systemd)
-15. [실행 로그 예시](#실행-로그-예시)
-16. [주의사항](#주의사항)
+13. [백업 및 복원](#-백업-및-복원)
+14. [자동 실행 (systemd)](#-자동-실행-systemd)
+15. [실행 로그 예시](#-실행-로그-예시)
+16. [주의사항](#-주의사항)
 17. [부록 — 빠른 레퍼런스](#부록--빠른-레퍼런스)
-18. [버튼 기반 제어(SoftKill/LED/Power)](#-버튼-기반-제어)
-19. [CLI (NO-MQTT) — main 로직 직접 시험](#CLI)
-20. [프로젝트 구조(업데이트 반영)](#프로젝트-구조)
-21. [변경 로그](#-변경-로그)
+18. [버튼 기반 제어(SoftKill/LED/Power)](#-버튼-기반-제어-SoftKill-LED-Power-)
+19. [CLI (NO-MQTT) — main 로직 직접 시험](#CLI--NO-MQTT---main-로직-직접-시험)
+21. [변경 로그](#변경-로그)
 
 ---
 
