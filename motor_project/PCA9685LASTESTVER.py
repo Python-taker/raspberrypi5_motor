@@ -15,7 +15,8 @@ pca9685_servo_module.py
 
 !! 주의 사항 !!
 1. I²C 인터페이스 활성화 필요 (`raspi-config` → Interface → I2C)
-2. Adafruit_PCA9685, Adafruit_GPIO, scipy 가상-환경(or 시스템)에 설치
+2. adafruit-circuitpython-pca9685, adafruit-blinka, scipy 가상-환경(or 시스템)에 설치
+   - (구) Adafruit_PCA9685 패키지 대신 CircuitPython 드라이버 사용
 3. pulse_values / actual_angles 은 환경에 따라 교정 가능
 
 📌 호출 관계
@@ -28,26 +29,43 @@ pca9685_servo_module.py
 # =====================================================
 # 0️⃣  IMPORTS & GLOBAL CONSTANTS
 # =====================================================
-# (변경) CircuitPython 버전의 PCA9685 사용
+# (구) from Adafruit_PCA9685 import PCA9685  → CircuitPython으로 교체
+import board, busio
 from adafruit_pca9685 import PCA9685 as _CP_PCA9685
-
-# (변경) Blinka + 확장 버스: I2C0(/dev/i2c-0) 강제 오픈용
-import board
-import busio
-try:
-    # 있으면 버스 번호로 /dev/i2c-0 직접 오픈
-    from adafruit_extended_bus import ExtendedI2C as _ExtI2C
-except Exception:
-    _ExtI2C = None  # 없으면 핀 기반 생성으로 대체
 
 from scipy.interpolate import interp1d
 import time
 from typing import List
 
 # ───── 실측 기반 상수 ────────────────────────────────
-PWM_HOME = 150              # 0 deg 기준 펄스
+PWM_HOME = 150              # 0 deg 기준 펄스(※ 12-bit tick 기준 가정)
 MOVE_MAXIMUM_ANGLE_LIST = [60, 60, 60, 60, 80, 80, 80, 80]
 MOVE_MINIMUM_PULSE = 15     # 서보가 무시하지 않는 최소 이동 펄스
+
+# =====================================================
+# 0-1️⃣  Legacy API 호환 래퍼
+#   - 예전 Adafruit_PCA9685의 set_pwm_freq()/set_pwm() 형태를 흉내냄
+#   - 내부적으로 CircuitPython PCA9685(ch.duty_cycle=0..65535)로 위임
+# =====================================================
+class _PCA9685Compat:
+    """Adafruit_CircuitPython PCA9685 ↔ (구) Adafruit_PCA9685 API 호환 래퍼"""
+
+    def __init__(self, cp: _CP_PCA9685):
+        self._cp = cp
+
+    def set_pwm_freq(self, freq: int) -> None:
+        # CircuitPython: frequency 속성
+        self._cp.frequency = int(freq)
+
+    def set_pwm(self, channel: int, on: int, off: int) -> None:
+        """
+        (구) API: set_pwm(ch, on, off)에서 on은 보통 0 사용.
+        여기서는 off(0..4095 tick)를 duty_cycle(0..65535)로 선형 변환.
+        """
+        off = max(0, min(4095, int(off)))
+        duty16 = int(round(off * 65535.0 / 4095.0))
+        self._cp.channels[int(channel)].duty_cycle = duty16
+
 
 # =====================================================
 # 1️⃣  실측 보간 데이터 (수정 금지: 로직 의존)
@@ -110,30 +128,6 @@ def get_pulse_from_angle(angle: float) -> int:
     """
     return int(round(float(interpolation_angle_to_pulse(angle))))
 
-# =====================================================
-# (추가) CircuitPython ↔ 기존 API 호환 래퍼
-#  - 기존 코드의 set_pwm(channel, 0, off_count(0..4095)) 호출을
-#    CircuitPython의 duty_cycle(0..65535)로 변환해서 수행
-# =====================================================
-class _CompatPCA9685:
-    def __init__(self, cp_obj: _CP_PCA9685):
-        self._cp = cp_obj
-
-    @property
-    def frequency(self) -> int:
-        return self._cp.frequency
-
-    @frequency.setter
-    def frequency(self, f: int) -> None:
-        self._cp.frequency = f
-
-    # 기존 Adafruit_PCA9685 호환
-    def set_pwm(self, channel: int, on: int, off: int) -> None:
-        # on 값은 무시(기존 코드에서도 항상 0 사용)
-        if off < 0: off = 0
-        if off > 4095: off = 4095
-        duty = int(off * 65535 // 4095)  # 12-bit → 16-bit 맵핑
-        self._cp.channels[channel].duty_cycle = duty
 
 # =====================================================
 # 3️⃣  HW 초기화 및 상태 관리
@@ -147,38 +141,15 @@ def init_pca9685(address: int = 0x60, freq: int = 50):
         freq (int): PWM 주파수
 
     Returns:
-        PCA9685: 제어 객체
+        PCA9685: 제어 객체 (구 API 호환 래퍼)
     """
-    # ---------- (핵심 수정) I2C0(/dev/i2c-0) 고정 ----------
-    i2c = None
-    if _ExtI2C is not None:
-        try:
-            i2c = _ExtI2C(0)  # /dev/i2c-0
-        except Exception:
-            i2c = None
-
-    if i2c is None:
-        # SCL0/SDA0 우선. 보드/버전에 따라 속성이 없으면 예외 발생 → 실패로 처리
-        scl = getattr(board, "SCL0")
-        sda = getattr(board, "SDA0")
-        i2c = busio.I2C(scl, sda)
-    # ---------------------------------------------------
-
-    last_err = None
-    # 주소 0x60 우선, 실패 시 0x40 재시도
-    for addr in (address, 0x40 if address != 0x40 else 0x60):
-        try:
-            # ✅ CircuitPython PCA9685: 첫 인자는 위치 인자로 I2C 버스 전달
-            _cp = _CP_PCA9685(i2c, address=addr)
-            _cp.frequency = freq
-            print(f"✅ PCA9685 초기화 완료 (0x{addr:X}, {freq} Hz)")
-            return _CompatPCA9685(_cp)
-        except Exception as e:
-            last_err = e
-            continue
-
-    # 둘 다 실패 시 마지막 예외 전파
-    raise last_err
+    # Pi 5 기본 I2C1 (board.SCL/SDA 사용)
+    i2c = busio.I2C(board.SCL, board.SDA)
+    _cp = _CP_PCA9685(i2c, address=address)
+    pwm = _PCA9685Compat(_cp)   # 구 API와 동일한 메서드 제공
+    pwm.set_pwm_freq(freq)
+    print(f"✅ PCA9685 초기화 완료 (0x{address:X}, {freq} Hz)")
+    return pwm
 
 
 def init_channel_positions(num_channels: int = 8) -> List[int]:
@@ -228,6 +199,7 @@ def move_to_pulse(pwm, channel: int, channel_positions: List[int], pulse: int):
         - channel_positions 업데이트
     """
     target_pulse = int(round(pulse))
+    # (구 API) set_pwm(ch, on=0, off=target_pulse)
     pwm.set_pwm(channel, 0, target_pulse)
     channel_positions[channel] = target_pulse
     time.sleep(0.3)
@@ -469,113 +441,7 @@ def safe_corrective_move(
             move_to_pulse(pwm, channel, channel_positions, pulse)
 
 # =====================================================
-# 6️⃣  MAIN 인터페이스 (메인에서 바로 쓰는 래퍼)
-#   - 내부 슬롯(4ch)은 각도 반전: target = 60 - theta
-#   - 외부 슬롯(4ch)은 입력 각도를 그대로 적용
-#   - 채널 매핑: 0~3=internal, 4~7=external
-# =====================================================
-
-INTERNAL_CHANNELS = [0, 1, 2, 3]
-EXTERNAL_CHANNELS = [4, 5, 6, 7]
-
-def _clamp_angle_for_channel(ch: int, angle: float) -> float:
-    """채널별 최대 각도 테이블에 맞춰 0..max 범위로 클램프."""
-    max_deg = float(MOVE_MAXIMUM_ANGLE_LIST[ch])
-    if angle < 0.0: return 0.0
-    if angle > max_deg: return max_deg
-    return angle
-
-def _apply_angle(pwm, channel: int, positions: list, angle_deg: float) -> None:
-    """안전 보정 이동(safe_corrective_move)로 1채널 적용."""
-    angle_deg = _clamp_angle_for_channel(channel, angle_deg)
-    safe_corrective_move(pwm, channel, positions, angle_deg)
-
-import threading
-
-class ServoAPI:
-    """
-    PCA9685 서보 8채널 제어의 얇은 고수준 래퍼.
-    - 내부 4ch: 입력 각도 θ → (60 - θ)로 반전 적용
-    - 외부 4ch: 입력 각도 그대로 적용
-    """
-    def __init__(self, address: int = 0x60, freq: int = 50, home: bool = True):
-        """
-        Args:
-            address: I²C 주소(기본 0x60)
-            freq: PWM 주파수(기본 50Hz)
-            home: True면 초기 스윕+HOME 수행
-        """
-        # initialize_servo_system(home=home) 대신 주소/주파수 인자 반영
-        self.pwm = init_pca9685(address=address, freq=freq)
-        self.positions = init_channel_positions()
-        if home:
-            home_all_channels(self.pwm, self.positions)
-
-        # 멀티스레드 제어 대비
-        self._lock = threading.Lock()
-
-    # -------------------------------------------------
-    # 내부/외부 일괄 적용 (각각 4개)
-    # -------------------------------------------------
-    def set_internal(self, internal_angles: list[float]) -> None:
-        """
-        내부 슬롯 4개(채널 0~3) 적용.
-        - 입력 각도 θ(0~60)를 (60-θ)로 반전 후 적용
-        """
-        if not isinstance(internal_angles, (list, tuple)) or len(internal_angles) != 4:
-            raise ValueError("internal_angles는 길이 4의 리스트여야 합니다.")
-        with self._lock:
-            for i, ch in enumerate(INTERNAL_CHANNELS):
-                theta_in = float(internal_angles[i])
-                theta_target = 60.0 - theta_in          # ★ 반전 규칙
-                _apply_angle(self.pwm, ch, self.positions, theta_target)
-
-    def set_external(self, external_angles: list[float]) -> None:
-        """
-        외부 슬롯 4개(채널 4~7) 적용.
-        - 입력 각도를 있는 그대로 적용
-        """
-        if not isinstance(external_angles, (list, tuple)) or len(external_angles) != 4:
-            raise ValueError("external_angles는 길이 4의 리스트여야 합니다.")
-        with self._lock:
-            for i, ch in enumerate(EXTERNAL_CHANNELS):
-                theta_target = float(external_angles[i])
-                _apply_angle(self.pwm, ch, self.positions, theta_target)
-
-    def set_both(self, internal_angles: list[float], external_angles: list[float]) -> None:
-        """내부 4개 + 외부 4개를 한 번에 적용 (단일 락으로 일관성 보장)."""
-        if (not isinstance(internal_angles, (list, tuple)) or len(internal_angles) != 4 or
-            not isinstance(external_angles, (list, tuple)) or len(external_angles) != 4):
-            raise ValueError("internal_angles/external_angles는 각각 길이 4의 리스트여야 합니다.")
-        with self._lock:
-            for i, ch in enumerate(INTERNAL_CHANNELS):
-                theta_in = float(internal_angles[i])
-                theta_target = 60.0 - theta_in
-                _apply_angle(self.pwm, ch, self.positions, theta_target)
-            for i, ch in enumerate(EXTERNAL_CHANNELS):
-                theta_target = float(external_angles[i])
-                _apply_angle(self.pwm, ch, self.positions, theta_target)
-
-    # -------------------------------------------------
-    # 편의 함수
-    # -------------------------------------------------
-    def home_channel(self, ch: int) -> None:
-        with self._lock:
-            go_to_home_position(self.pwm, ch, self.positions)
-
-    def home_all(self) -> None:
-        with self._lock:
-            home_all_channels(self.pwm, self.positions)
-
-    def close(self) -> None:
-        """PCA9685는 별도 close가 없어도 되지만, 필요 시 확장용."""
-        try:
-            pass  # Adafruit_PCA9685는 명시적 종료 API 없음
-        except Exception:
-            pass
-
-# =====================================================
-# 7️⃣ CLI ─ 단독 테스트용 진입점
+# 6️⃣  CLI ─ 단독 테스트용 진입점
 # -----------------------------------------------------
 # • initialize_servo_system() 으로 HW / 상태 초기화
 # • 숫자 메뉴로 각 기능 단일 테스트
@@ -669,14 +535,3 @@ def main() -> None:
 # ── 단독 실행 시 main()만 호출 ────────────────────────
 if __name__ == "__main__":
     main()
-
-# =====================================================
-# 8️⃣  예시 사용 (main.py에서)
-# -----------------------------------------------------
-# from drivers.pca9685_servo_module import ServoAPI
-# servo = ServoAPI(home=True)
-# servo.set_internal([0, 10, 20, 30])     # 내부: 실제로는 [60,50,40,30]로 적용
-# servo.set_external([15, 25, 35, 45])    # 외부: 그대로 적용
-# servo.set_both([0,0,0,0], [0,0,0,0])    # 동시 적용
-# servo.home_all()
-# =====================================================

@@ -287,6 +287,11 @@ class ArduinoFanLedBridge:
             else:
                 out.append(c)
         return out
+    
+    def set_tsv(self, values):
+        vals = [float(v) for v in (list(values)+[0,0,0,0])[:4]]
+        cmd = "SETT " + " ".join(f"{v:.2f}" for v in vals)
+        return self.send_command(cmd)  # 클래스에 맞게 send/send_command/write_line 중 하나 사용
 
 
 # =====================================================
