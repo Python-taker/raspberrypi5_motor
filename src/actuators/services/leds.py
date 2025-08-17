@@ -9,10 +9,18 @@ services/leds.py
   C) {"tsv":{"tsv":[...], "temp_avg":..., "target_temp_avg":...}}  ← 중첩형
 
 출력:
-  • for_driver_colors()   → ["R"|"B"|"W"] * 4
-  • for_driver_values()   → [float] * 4 (클램프/패딩 완료)
-  • to_arduino_cmd_colors()  → "SETL C1 C2 C3 C4"
-  • to_arduino_cmd_values()  → "SETT v1 v2 v3 v4" (소수 2자리)
+  • for_driver_colors()              → ["R"|"B"|"W"] * 4  (소프트킬 미적용, 순수 매핑)
+  • for_driver_colors_effective(...) → ["R"|"B"|"W"|"OFF"] * 4  (소프트킬 적용 결과)
+  • for_driver_values()              → [float] * 4 (클램프/패딩 완료)
+  • to_arduino_cmd_colors()          → "SETL C1 C2 C3 C4"  (소프트킬 미적용)
+  • to_arduino_cmd_colors_effective(...) → "SETL C1 C2 C3 C4" (소프트킬 적용)
+  • to_arduino_cmd_values()          → "SETT v1 v2 v3 v4" (소수 2자리)
+
+소프트킬 연동:
+  - softkill가 "killed=True"일 때 LED를 강제로 끄려면
+      colors = svc.for_driver_colors_effective(softkill_killed=True, off_token="OFF")  # or "W"
+    또는
+      cmd = svc.to_arduino_cmd_colors_effective(softkill_killed=True, off_token="OFF")
 """
 
 from __future__ import annotations
@@ -86,7 +94,8 @@ def _extract_tsv4(payload: Mapping[str, Any]) -> List[float]:
 @dataclass
 class LedState:
     raw_tsv: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
-    colors:  List[str]   = field(default_factory=lambda: ["W", "W", "W", "W"])
+    colors:  List[str]   = field(default_factory=lambda: ["W", "W", "W", "W"])   # 순수 매핑 결과(R/B/W)
+    effective_colors: List[str] = field(default_factory=lambda: ["W", "W", "W", "W"])  # 소프트킬 적용 반영(R/B/W/OFF)
     temp_avg: float = 0.0
     target_temp_avg: float = 0.0
 
@@ -96,6 +105,7 @@ class LedState:
 class LedService:
     """
     TSV(4개) → 색상(4개) 매핑 + 원시 TSV 전송을 위한 서비스.
+    소프트킬(킬스위치) 적용 시에는 effective_colors를 사용.
     """
     def __init__(
         self,
@@ -104,6 +114,7 @@ class LedService:
         hot_low: float = TSV_HOT_LOW,
         tsv_min: float = TSV_MIN,
         tsv_max: float = TSV_MAX,
+        default_off_token: str = "OFF",   # "OFF" 또는 "W" 권장
     ) -> None:
         if not (cold_high < hot_low):
             raise ValueError("cold_high < hot_low 여야 합니다. (예: -0.5 < 0.5)")
@@ -111,6 +122,9 @@ class LedService:
         self._hot_low   = float(hot_low)
         self._tsv_min   = float(tsv_min)
         self._tsv_max   = float(tsv_max)
+        self._default_off_token = str(default_off_token).upper()
+        if self._default_off_token not in {"OFF", "W"}:
+            raise ValueError("default_off_token은 'OFF' 또는 'W'만 허용됩니다.")
         self.state = LedState()
 
     # -------------------------------------------------
@@ -130,25 +144,49 @@ class LedService:
 
         self.state.raw_tsv = tsv4
         self.state.colors = colors
+        self.state.effective_colors = list(colors)  # 기본은 동일, 소프트킬 적용 시 별도 오버라이드
         self.state.temp_avg = _to_float(temp_avg, 0.0)
         self.state.target_temp_avg = _to_float(target_temp_avg, 0.0)
         return colors
 
     # -------------------------------------------------
-    # 드라이버/브리지 전달
+    # 드라이버/브리지 전달 (소프트킬 미적용: 기존 호환)
     # -------------------------------------------------
     def for_driver_colors(self) -> List[str]:
+        """순수 매핑(R/B/W) — 기존 코드와 100% 호환."""
         return list(self.state.colors)
 
     def for_driver_values(self) -> List[float]:
         return list(self.state.raw_tsv)
 
     # -------------------------------------------------
+    # 드라이버/브리지 전달 (소프트킬 적용)
+    # -------------------------------------------------
+    def for_driver_colors_effective(self, *, softkill_killed: bool, off_token: str | None = None) -> List[str]:
+        """
+        소프트킬 적용 결과를 반환.
+        softkill_killed=True → [off_token]*4
+        softkill_killed=False → 순수 매핑 colors
+        """
+        token = (off_token or self._default_off_token).upper()
+        if token not in {"OFF", "W"}:
+            raise ValueError("off_token은 'OFF' 또는 'W'만 허용됩니다.")
+        eff = [token, token, token, token] if softkill_killed else list(self.state.colors)
+        self.state.effective_colors = eff
+        return eff
+
+    # -------------------------------------------------
     # 아두이노 프로토콜 문자열
     # -------------------------------------------------
     def to_arduino_cmd_colors(self) -> str:
-        # 예: "SETL R W B R"
+        # 예: "SETL R W B R"  (소프트킬 미적용)
         c1, c2, c3, c4 = self.state.colors
+        return f"SETL {c1} {c2} {c3} {c4}"
+
+    def to_arduino_cmd_colors_effective(self, *, softkill_killed: bool, off_token: str | None = None) -> str:
+        # 예: "SETL OFF OFF OFF OFF"  (소프트킬 적용 시)
+        cols = self.for_driver_colors_effective(softkill_killed=softkill_killed, off_token=off_token)
+        c1, c2, c3, c4 = cols
         return f"SETL {c1} {c2} {c3} {c4}"
 
     def to_arduino_cmd_values(self) -> str:
@@ -162,6 +200,7 @@ class LedService:
     def to_status(self) -> dict:
         return {
             "led_colors": list(self.state.colors),
+            "led_colors_effective": list(self.state.effective_colors),
             "tsv": list(self.state.raw_tsv),
             "temp_avg": self.state.temp_avg,
             "target_temp_avg": self.state.target_temp_avg,

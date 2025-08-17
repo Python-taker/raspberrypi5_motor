@@ -8,6 +8,13 @@ main.py
     2) control/hvac/{id}/tsv  및  status/hvac/{id}/tsv
     3) control/hvac/{id}/power_server
 - 상태 발행: status/hvac/{id}/all
+
+변경 사항(서보 관련):
+- 부팅 직후: ServoAPI OE Enable → home_all() 수행
+- 소프트킬 전환 시:
+  • killed=True(OFF 진입): 안전 OFF 적용 후, 서보 OE Enable → home_all() → OE Disable
+  • killed=False(ON 복귀): 서보 OE Enable → home_all()
+- OE 제어 메서드명 수정: global_enable_outputs / global_disable_outputs
 """
 
 # =====================================================
@@ -32,16 +39,21 @@ from config import (
     TOPIC_STATUS_ALL,
     TOPICS_SUB,
     TOPICS_PUB,
-    STATUS_USE_APPLIED,   # ★ 추가
-    LED_TSV_ORDER,   # ★ 추가
-    LED_HW_ORDER,    # ★ 추가
+    STATUS_USE_APPLIED,  # ★
+    LED_TSV_ORDER,       # ★
+    LED_HW_ORDER,        # ★
 )
 from mqtt_client import MQTTClient
 
 from actuators.services.peltier import PeltierService, MIN_ON_DUTY_DEFAULT
 from actuators.services.servo import ServoService
 from actuators.drivers import bts7960_peltier_pwm as pdrv
-from actuators.drivers.pca9685_servo_module import ServoAPI
+from actuators.drivers.pca9685_servo_module import ServoAPI  # ServoAPI.home_all() 사용
+
+try:
+    from actuators.services.fans import FanService
+except ModuleNotFoundError:
+    from services.fans import FanService
 
 try:
     from actuators.services.leds import LedService
@@ -58,6 +70,11 @@ except Exception:
     except Exception:
         ArduinoFanLedClient = None
 
+from controls.softkill import SoftKillController  # ★
+
+softkill: SoftKillController | None = None        # ★
+_softkill_killed = False                          # ★
+
 # =====================================================
 # 1) Globals
 # =====================================================
@@ -67,8 +84,14 @@ BROKER_PORT = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 
 mqttc: MQTTClient | None = None
 svc_peltier = PeltierService(min_on_duty=MIN_ON_DUTY_DEFAULT, rounding="floor")
-svc_servo   = ServoService()
+# 허용 오차(디그리). 같다고 볼 범위. 환경변수로 조정 가능 (기본 0.2°)
+SERVO_EPS_DEG = float(os.getenv("SERVO_EPS_DEG", "0.2"))
+
+# 기존: svc_servo = ServoService()
+# 미세 떨림 줄이려면 0.1도 라운딩(선택)
+svc_servo   = ServoService(round_to=1)   # 0.1° 단위 반올림
 svc_leds    = LedService()
+svc_fans = FanService(min_small_on=int(os.getenv("MIN_SMALL_FAN_ON", "30")))
 
 servo_drv: ServoAPI | None = None
 ardu: Any = None
@@ -96,6 +119,100 @@ raw_cmd = {
 # =====================================================
 # 2) Drivers
 # =====================================================
+def _servo_home_all(tag: str = "") -> None:
+    """서보 OE Enable 후 전채널 홈으로. 예외는 조용히 무시."""
+    if not servo_drv:
+        return
+    try:
+        # OE Enable (라즈베리  /OE 핀 사용 시 실제로 Enable)
+        if hasattr(servo_drv, "global_enable_outputs"):
+            servo_drv.global_enable_outputs()
+        print(f"🔧 Servo home_all() 시작 {('('+tag+')') if tag else ''}")
+        servo_drv.home_all()
+        print("✅ Servo home_all() 완료")
+    except Exception as e:
+        print(f"⚠ Servo home_all 실패: {e}")
+
+def _servo_disable_outputs() -> None:
+    if not servo_drv:
+        return
+    try:
+        if hasattr(servo_drv, "global_disable_outputs"):
+            servo_drv.global_disable_outputs()
+    except Exception:
+        pass
+
+def _softkill_init():
+    """소프트킬 컨트롤러 초기화 + 콜백 연결."""
+    global softkill, _softkill_killed
+
+    # 환경변수로 핀/극성 설정 (없으면 기본값)
+    btn   = int(os.getenv("GPIO_KILL_PIN", "-1"))
+    red   = int(os.getenv("GPIO_LED_RED_PIN", "-1"))
+    green = int(os.getenv("GPIO_LED_GREEN_PIN", "-1"))
+    active_low      = os.getenv("GPIO_KILL_ACTIVE_LOW", "1") in ("1", "true", "True")
+    led_active_high = os.getenv("GPIO_LED_ACTIVE_HIGH", "1") in ("1", "true", "True")
+
+    def _on_change(killed: bool, reason: str):
+        """버튼/원격으로 소프트킬 상태 변경 시 실제 장치/LED/MQTT 처리."""
+        nonlocal btn, red, green
+        global _softkill_killed
+        _softkill_killed = bool(killed)
+
+        if killed:
+            # === OFF 진입 ===
+            # 1) 핵심 장치 OFF
+            try: pdrv.set_duty(0)
+            except: pass
+            try: pdrv.safe_init()      # EN 라인 LOW
+            except: pass
+
+            # 2) 팬/LED 안전 상태
+            _apply_fans([0] * 8, 0)    # 아두이노 팬 OFF
+            cols_logic = svc_leds.for_driver_colors_effective(softkill_killed=True, off_token="OFF")
+            cols_hw    = _remap4(cols_logic, LED_HW_ORDER, fill="OFF")
+            _ardu_send_leds(cols_hw)
+
+            # 3) 서보: OE Enable → 홈 → OE Disable (정지자세로 수납)
+            _servo_home_all(tag="softkill→OFF")
+            _servo_disable_outputs()
+
+        else:
+            # === ON 복귀 ===
+            try: pdrv.safe_init()
+            except: pass
+            try: pdrv.enable_forward()
+            except: pass
+
+            # 서보 OE Enable → 홈(기준자세)로 맞춘 뒤 동작 시작
+            _servo_home_all(tag="softkill→ON")
+
+            # LED는 최신 TSV 매핑 재적용(논리→물리 리맵 후 전송)
+            cols_logic = svc_leds.for_driver_colors_effective(softkill_killed=False)
+            cols_hw    = _remap4(cols_logic, LED_HW_ORDER, fill="W")
+            _ardu_send_leds(cols_hw)
+
+        # 대시보드/서버에 “라즈베리파이 액추에이터 전원 상태” 통지
+        if mqttc:
+            topic = f"control/hvac/{HVAC_ID}/power_actuator"
+            mqttc.publish_json(topic, {"hvac_id": HVAC_ID, "power": ("off" if killed else "on")})
+
+        _publish_status()  # 상태 한 번 발행
+
+    # 컨트롤러 만들기 (기본: 부팅 시 GREEN=켜짐)
+    softkill = SoftKillController(
+        button_pin=btn,
+        active_low=active_low,
+        led_red_pin=red,
+        led_green_pin=green,
+        led_active_high=led_active_high,
+        on_change=_on_change,
+        initial_killed=False,   # 부팅=ON(GREEN)
+    )
+    # 내부 플래그 초기 동기화
+    _softkill_killed = softkill.is_killed
+
+
 def _driver_init() -> None:
     global servo_drv, ardu
     pdrv.safe_init()
@@ -103,8 +220,11 @@ def _driver_init() -> None:
     pdrv.set_duty(0)
 
     try:
+        # home=False로 만들고 아래에서 명시적으로 home_all() 실행
         servo_drv = ServoAPI(home=False)
         print("✅ Servo 준비 완료.")
+        # === 부팅 직후: OE Enable → home_all() 수행 ===
+        _servo_home_all(tag="startup")
     except Exception as e:
         print(f"⚠ Servo 초기화 생략: {e}")
         servo_drv = None
@@ -119,6 +239,8 @@ def _driver_init() -> None:
             print(f"⚠ Arduino 연결 생략(오류): {e}")
 
     print(f"✅ Drivers ready (BTS7960 MIN_ON={MIN_ON_DUTY_DEFAULT}%)")
+    _softkill_init()  # ★
+
 
 def _driver_safe_off() -> None:
     try:
@@ -156,6 +278,7 @@ def _to_pwm_list(value: Any, max_len: int) -> List[int]:
         lst += [0] * (max_len - len(lst))
     return lst[:max_len]
 
+
 def _to_num_list(value: Any, max_len: int, as_float: bool = False) -> List[float | int]:
     """원본 보존용: 0~100 클램프 없이 숫자 변환만, 길이 보정"""
     lst: List[float | int] = []
@@ -175,6 +298,7 @@ def _to_num_list(value: Any, max_len: int, as_float: bool = False) -> List[float
         lst += [0.0 if as_float else 0] * (max_len - len(lst))
     return lst[:max_len]
 
+
 def _extract_tsv4(data: dict) -> List[float]:
     if not isinstance(data, dict):
         return [0, 0, 0, 0]
@@ -192,8 +316,10 @@ def _extract_tsv4(data: dict) -> List[float]:
             return list(v)[:4]
     return [0, 0, 0, 0]
 
+
 def _airflow_word() -> str:
     return "on" if (any(state["fan_small_pwm"]) or state["fan_main_pwm"] > 0) else "off"
+
 
 def _publish_status() -> None:
     if mqttc is None:
@@ -211,7 +337,7 @@ def _publish_status() -> None:
         fan_small     = raw_cmd["fan_small_pwm"]
         fan_main      = raw_cmd["fan_main_pwm"]
 
-    # 소비에너지 추정은 실제 적용값 기준(원한다면 플래그로 분기 가능)
+    # 소비에너지 추정은 실제 적용값 기준
     energy_wh_30s = estimate_energy_wh_30s(
         peltier_pwm=state["peltier_pwm"],
         fan_small_pwms=state["fan_small_pwm"],
@@ -254,6 +380,7 @@ def _ardu_send_fans(s1: int, s2: int, s3: int, s4: int, big: int) -> None:
     except Exception as e:
         print(f"⚠ 팬 전송 실패: {e}")
 
+
 def _ardu_send_leds(colors: List[str]) -> None:
     if not ardu:
         return
@@ -276,42 +403,69 @@ def _ardu_send_leds(colors: List[str]) -> None:
 
 # ---- Apply helpers ----
 def _apply_fans(small8: List[int] | None = None, big: int | None = None) -> None:
+    # 소형 4개가 들어오면: FanService로 '적용값' 산출 → 상태 갱신 → 전송
     if small8 is not None:
-        small8 = _to_pwm_list(small8, 8)
-        state["fan_small_pwm"] = small8
-        s1, s2, s3, s4 = small8[:4]
-        bigp = state["fan_main_pwm"] if big is None else max(0, min(100, int(big)))
-        _ardu_send_fans(s1, s2, s3, s4, bigp)
+        # FanService는 소형 4개만 의미 있음
+        payload = {
+            "small_fan_pwm": list(small8)[:4],
+            "large_fan_pwm": state["fan_main_pwm"] if big is None else big,
+        }
+        applied5 = svc_fans.preprocess(payload)     # [f1,f2,f3,f4,big] (소형=30..100 매핑)
+        f1, f2, f3, f4, bigp = applied5
 
-    if big is not None:
+        # 상태(적용값) 반영: fan_small_pwm[0..3]만 갱신, 나머지 [4..7]은 기존 유지
+        state["fan_small_pwm"][:4] = [f1, f2, f3, f4]
+        state["fan_main_pwm"] = bigp
+
+        _ardu_send_fans(f1, f2, f3, f4, bigp)
+
+    # 대형만 바뀌면: 소형은 현재 '적용값' 그대로 사용하여 전송
+    if small8 is None and big is not None:
         v = max(0, min(100, int(big)))
         state["fan_main_pwm"] = v
-        s1, s2, s3, s4 = state["fan_small_pwm"][:4]
-        _ardu_send_fans(s1, s2, s3, s4, v)
+        f1, f2, f3, f4 = state["fan_small_pwm"][:4]   # 이미 적용값(매핑 후) 보관됨
+        _ardu_send_fans(f1, f2, f3, f4, v)
 
 def _apply_servos(internal4: List[float] | None, external4: List[float] | None) -> None:
+    """
+    서보 적용:
+      - 부분 업데이트 시 빠진 쪽은 현재 state 값을 넣어 전처리하여
+        svc_servo.state와의 일관성을 유지한다.
+      - 드라이버 호출은 '요청된 쪽'이 이전 상태와 실제로 달라질 때만 수행한다.
+    """
     if internal4 is None and external4 is None:
         return
-    payload: dict[str, Any] = {}
-    if internal4 is not None:
-        payload["internal_servo"] = internal4
-    if external4 is not None:
-        payload["external_servo"] = external4
-    i4, e4 = svc_servo.preprocess(payload)
-    if internal4 is not None:
-        state["servo_internal"] = i4
-    if external4 is not None:
-        state["servo_external"] = e4
+
+    # 1) 전처리 입력 구성: 빠진 쪽은 현재 상태로 채움
+    payload: dict[str, Any] = {
+        "internal_servo": internal4 if internal4 is not None else state["servo_internal"],
+        "external_servo": external4 if external4 is not None else state["servo_external"],
+    }
+    new_i, new_e = svc_servo.preprocess(payload)
+
+    # 2) 변경 여부 판단(요청된 쪽만 비교)
+    changed_i = internal4 is not None and not _angles_close(new_i, state["servo_internal"])
+    changed_e = external4 is not None and not _angles_close(new_e, state["servo_external"])
+
+    # 3) 드라이버 호출: 바뀐 쪽만
     if servo_drv:
         try:
-            if internal4 is not None and external4 is not None:
-                servo_drv.set_both(state["servo_internal"], state["servo_external"])
-            elif internal4 is not None:
-                servo_drv.set_internal(state["servo_internal"])
-            elif external4 is not None:
-                servo_drv.set_external(state["servo_external"])
+            if changed_i and changed_e:
+                servo_drv.set_both(new_i, new_e)
+            elif changed_i:
+                servo_drv.set_internal(new_i)
+            elif changed_e:
+                servo_drv.set_external(new_e)
+            else:
+                print("[Servo] unchanged → skip driver call")
         except Exception as e:
             print(f"⚠ Servo 반영 실패: {e}")
+
+    # 4) 상태 동기화(요청된 쪽만 갱신)
+    if internal4 is not None:
+        state["servo_internal"] = new_i
+    if external4 is not None:
+        state["servo_external"] = new_eW
 
 def _apply_peltier(raw_pwm: Any) -> None:
     if raw_pwm is None:
@@ -328,7 +482,6 @@ def _apply_peltier(raw_pwm: Any) -> None:
     state["peltier_pwm"] = applied
     print(f"[Peltier] raw={svc_peltier.state.raw_duty} → applied={applied}")
 
-# ---- Apply helpers ----
 def _apply_led_from_payload(payload: dict | list[float]) -> None:
     """
     들어온 TSV → (1) TSV 입력 정렬(LED_TSV_ORDER)
@@ -339,7 +492,7 @@ def _apply_led_from_payload(payload: dict | list[float]) -> None:
     if isinstance(payload, (list, tuple)):
         payload = {"tsv": list(payload)[:4]}
 
-    # 2) TSV 4개 추출(원래 헬퍼 재사용)
+    # 2) TSV 4개 추출
     tsv_in = _extract_tsv4(payload)
 
     # 3) TSV 입력 정렬: 들어온 순서를 LedService가 기대하는 '논리 슬롯' 순서로
@@ -351,12 +504,28 @@ def _apply_led_from_payload(payload: dict | list[float]) -> None:
     # 5) LED 물리 채널 정렬: 논리 슬롯 → 아두이노 실제 채널 순서
     colors_hw = _remap4(colors_logic, LED_HW_ORDER, fill="W")
 
-    # 6) 상태 저장 및 전송
+    # 6) 상태 저장 및 전송 (소프트킬 반영)
     state["led_colors"] = colors_hw
-    _ardu_send_leds(colors_hw)
 
-    # (선택) 디버그 로그
-    print(f"[LED] TSV_in={tsv_in} → logic={tsv_logic} → colors_logic={colors_logic} → colors_hw={colors_hw}")
+    # 소프트킬 반영
+    effective_logic = svc_leds.for_driver_colors_effective(
+        softkill_killed=_softkill_killed,
+        off_token="OFF",  # 필요시 "W"로 변경 가능
+    )
+    # effective는 논리 순서이므로, HW 순서로 다시 정렬
+    effective_hw = _remap4(effective_logic, LED_HW_ORDER, fill="OFF")
+    _ardu_send_leds(effective_hw)
+
+    # 디버그 로그
+    print(
+        f"[LED] TSV_in={tsv_in} → logic={tsv_logic} → colors_logic={colors_logic} "
+        f"→ colors_hw={colors_hw} → effective_hw={effective_hw}"
+    )
+
+def _angles_close(a: List[float], b: List[float], eps: float = SERVO_EPS_DEG) -> bool:
+    if len(a) != 4 or len(b) != 4:
+        return False
+    return all(abs(float(x) - float(y)) <= eps for x, y in zip(a, b))
 
 def _all_off() -> None:
     _apply_peltier(0)
@@ -365,20 +534,11 @@ def _all_off() -> None:
 
 # =====================================================
 # 3-1) 공용 인덱스 리맵 도구
-# - dst[i] = src[index_map[i]]  (길이 4 전제, 방어적 보정)
 # =====================================================
 def _remap4(src_seq, index_map, *, fill=0):
     """
     길이 4 시퀀스 src_seq를 index_map에 맞춰 재배열.
     dst[i] = src_seq[index_map[i]]
-
-    Args:
-        src_seq: 원본 시퀀스(길이 4 가정, 짧아도 안전 처리)
-        index_map: 0..3 순열(검증은 config에서 수행)
-        fill: 범위 밖/결측 시 대체값
-
-    Returns:
-        list: 재배열된 길이 4 리스트
     """
     out = []
     for src_idx in index_map:
@@ -389,7 +549,6 @@ def _remap4(src_seq, index_map, *, fill=0):
     if len(out) < 4:
         out += [fill] * (4 - len(out))
     return out[:4]
-
 
 # =====================================================
 # 4) MQTT Handler
@@ -423,13 +582,23 @@ def on_mqtt(topic: str, data: dict) -> None:
             if "external_servo" in data:
                 raw_cmd["servo_external"] = _to_num_list(data.get("external_servo"), 4, as_float=True)
 
-            # ---- 실제 적용(기존 로직) ----
+            # ---- 소프트킬 중이면 하드웨어 적용만 건너뜀 ----
+            if _softkill_killed:
+                print("[SOFTKILL] /value 수신: raw만 갱신, 하드웨어 적용 차단")
+                _publish_status()
+                return
+
+            # ---- 실제 적용 (팬은 small/big 동시반영으로 SETF 1회) ----
             _apply_peltier(data.get("peltier_pwm"))
+
             small = data.get("fan_small_pwm") or data.get("small_fan_pwm")
-            if small is not None:
-                _apply_fans(small8=small)
-            if "fan_main_pwm" in data or "large_fan_pwm" in data:
-                _apply_fans(big=(data.get("fan_main_pwm") or data.get("large_fan_pwm")))
+            big   = data.get("fan_main_pwm") or data.get("large_fan_pwm")
+            if (small is not None) or (big is not None):
+                _apply_fans(
+                    small8=small if small is not None else None,
+                    big=big if big is not None else None
+                )
+
             _apply_servos(data.get("internal_servo"), data.get("external_servo"))
 
             _publish_status()
@@ -441,14 +610,14 @@ def on_mqtt(topic: str, data: dict) -> None:
 
         elif topic.endswith("/power_server"):
             pv = str(data.get("power", "")).strip().lower()
-            is_off = pv in ("0", "false", "off") or pv == "" or pv is False or pv == 0
-            is_on  = pv in ("1", "true", "on") or pv is True or pv == 1
-            if is_off:
-                _all_off()
-            elif is_on:
-                pass
+            want_off = pv in ("0", "false", "off")
+            want_on  = pv in ("1", "true", "on")
+            if softkill:
+                if want_off:
+                    softkill.set_state(True, emit=True, reason="mqtt")
+                elif want_on:
+                    softkill.set_state(False, emit=True, reason="mqtt")
             _publish_status()
-
     except Exception as e:
         print(f"[on_mqtt][Error] {e}")
 
@@ -489,10 +658,25 @@ def main():
             time.sleep(0.5)
     finally:
         try:
+            # ① 종료 직전 RP i 소프트킬 RED ON (대시보드에도 off 통지됨: on_change 콜백 내 publish)
+            if softkill:
+                softkill.set_state(True, emit=True, reason="shutdown")
+                # softkill.cleanup()  # ← 라즈베리 LED까지 끄려면 사용 (기본은 RED 유지)
+        except Exception:
+            pass
+
+        try:
             if mqttc:
                 mqttc.disconnect()
         finally:
+            # ② 장치 안전 OFF
             _driver_safe_off()
+            # ③ Arduino 측 LED는 'OFF'로 유지하고 종료
+            try:
+                _ardu_send_leds(["OFF", "OFF", "OFF", "OFF"])
+            except Exception:
+                pass
+
         print("✅ Cleaned up. Bye.")
 
 if __name__ == "__main__":

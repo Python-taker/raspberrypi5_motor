@@ -10,10 +10,10 @@
 ## 📑 목차
 
 1. [프로젝트 개요](#프로젝트-개요)
-2. [사전 요구사항](#사전-요구사항)
-3. [빠른 실행](#빠른-실행)
-4. [설치 및 환경 구성](#설치-및-환경-구성)
-5. [UART 문제 해결](#uart-문제-해결)
+2. [사전 요구사항](#-사전-요구사항)
+3. [빠른 실행](#-빠른-실행)
+4. [설치 및 환경 구성](#-설치-및-환경-구성)
+5. [UART 문제 해결](#-uart-문제-해결)
 6. [모듈 목록](#모듈-목록)
 7. [하드웨어 연결 (라즈베리파이 기준)](#하드웨어-연결-라즈베리파이-기준)
 8. [모듈 상세](#모듈-상세)
@@ -37,6 +37,10 @@
 15. [실행 로그 예시](#실행-로그-예시)
 16. [주의사항](#주의사항)
 17. [부록 — 빠른 레퍼런스](#부록--빠른-레퍼런스)
+18. [버튼 기반 제어(SoftKill/LED/Power)](#-버튼-기반-제어)
+19. [CLI (NO-MQTT) — main 로직 직접 시험](#CLI)
+20. [프로젝트 구조(업데이트 반영)](#프로젝트-구조)
+21. [변경 로그](#-변경-로그)
 
 ---
 
@@ -100,37 +104,43 @@ mkdir sensor_project scripts
 
 ```
 ssafy_project/
-├── .venv/                      # Python 가상환경
-├── scripts/                    # 백업 및 의존성 관리 스크립트
-│   ├── backup.sh
-│   ├── freeze_deps.sh
-│   └── restore.sh
+├─ .venv/                            # Python 가상환경
+├─ scripts/                          # 백업 및 의존성 관리 스크립트
+│  ├─ backup.sh
+│  ├─ freeze_deps.sh
+│  └─ restore.sh
 ├─ arduino/
 │  └─ multi_fan_led_serial_control.ino
 ├─ src/
-│  ├─ __init__.py                 # (권장) src 패키지 루트 표시
-│  ├─ main.py                     # 엔트리포인트
+│  ├─ __init__.py                     # (권장) src 패키지 루트 표시
+│  ├─ main.py                         # 통합 제어 엔트리 (서보 홈/SoftKill/LED 리맵, 중복호출 억제)
 │  ├─ mqtt_client.py
 │  ├─ config.py
-│  ├─ import_test.py              # 필요 시 유지
-│  └─ actuators/
-│     ├─ __init__.py              # (권장) 상위 패키지 고정
-│     ├─ drivers/
-│     │  ├─ __init__.py
-│     │  ├─ arduino_bridge.py
-│     │  ├─ bts7960_peltier_pwm.py
-│     │  └─ pca9685_servo_module.py
-│     └─ services/
-│        ├─ __init__.py
-│        ├─ fans.py
-│        ├─ leds.py
-│        ├─ peltier.py
-│        ├─ peltier_with_temp.py
-│        └─ servo.py
-├── requirements.txt
-├── .env
-├── .gitignore
-└── README.md
+│  ├─ actuators/
+│  │  ├─ drivers/
+│  │  │  ├─ __init__.py               # (권장) 상위 패키지 고정
+│  │  │  ├─ bts7960_peltier_pwm.py
+│  │  │  ├─ pca9685_servo_module.py   # /OE 제어, home_all(), 미세조정 로직
+│  │  │  └─ arduino_bridge.py
+│  │  └─ services/
+│  │     ├─ __init__.py               # (권장) 상위 패키지 고정
+│  │     ├─ fans.py
+│  │     ├─ leds.py
+│  │     ├─ peltier.py
+│  │     ├─ peltier_with_temp.py
+│  │     └─ servo.py                  # 반전 없음, 전처리/상태 유지
+│  ├─ controls/
+│  │  └─ softkill.py                  # 물리 버튼/LED 제어 + on_change 콜백
+│  ├─ scripts/
+│  │  ├─ gpio_toggler.py              # (도움 스크립트) GPIO 토글 실험
+│  │  └─ mqtt_sniff.py                # (도움 스크립트) MQTT 스니퍼
+│  ├─ utils/
+│  │  └─ energy_meter.py
+│  └─ cli_actuator_test.py            # NO-MQTT CLI
+├─ requirements.txt
+├─ .env
+├─ .gitignore
+└─ README.md
 ```
 
 ### 3. 가상환경 생성 및 활성화
@@ -174,7 +184,7 @@ sudo usermod -aG dialout $USER && newgrp dialout
 
 | 모듈                  | 파일                                              | 기능 설명                    | 연결           |
 | ------------------- | ----------------------------------------------- | ------------------------ | ------------ |
-| **PCA9685 Servo**   | `src/actuators/drivers/pca9685_servo_module.py` | 16채널 서보 PWM 제어, 각도↔펄스 변환 | I²C          |
+| **PCA9685 Servo**   | `src/actuators/drivers/pca9685_servo_module.py` | 16채널 서보 PWM 제어, 각도↔펄스 변환, /OE  | I²C          |
 | **BTS7960 Peltier** | `src/actuators/drivers/bts7960_peltier_pwm.py`  | 펠티어 정방향 PWM, EN/안전 시퀀스   | GPIO+PWM     |
 | **Arduino Bridge**  | `src/actuators/drivers/arduino_bridge.py`       | USB 시리얼로 팬/LED 제어 송신     | USB CDC(ACM) |
 | **Fans Service**    | `src/actuators/services/fans.py`                | 팬 제어 상위 래퍼/오케스트레이션       | 내부 호출        |
@@ -182,9 +192,12 @@ sudo usermod -aG dialout $USER && newgrp dialout
 | **Peltier Service** | `src/actuators/services/peltier.py`             | BTS7960 제어용 듀티 전처리       | 내부 호출        |
 | **Peltier+Temp**    | `src/actuators/services/peltier_with_temp.py`   | 온도 기반 가중 보정 포함 듀티 전처리    | 내부 호출        |
 | **Servo Service**   | `src/actuators/services/servo.py`               | 서보 각도 전처리(반전은 드라이버)      | I²C(간접)      |
+| **SoftKill**        | `src/controls/softkill.py`                      | 물리 버튼/LED(R/G) 기반 소프트킬 컨트롤러    | GPIO   |
 | **Main**            | `src/main.py`                                   | 엔트리, 서비스 구동              | —            |
 | **MQTT Client**     | `src/mqtt_client.py`                            | 명령 수신/상태 발행              | TCP/MQTT     |
+| **Energy Meter**    | `src/utils/energy_meter.py`                     | 30초 기준 소비전력 추정           | 내부 호출    |
 | **Config**          | `src/config.py`                                 | 브로커/토픽/환경변수              | —            |
+| **CLI Test**        | `src/cli_actuator_test.py`                      | MQTT 없이 main 로직 직접 시험     | 콘솔 상호작용(USB/I²C)  |
 
 ---
 
@@ -203,16 +216,20 @@ sudo usermod -aG dialout $USER && newgrp dialout
 | I²C SDA/SCL → PCA9685  | GPIO 2 / GPIO 3           | 3.3 V 풀업(보드 내장 시 생략 가능)               |
 | BTS7960 R\_EN / R\_PWM | **GPIO 17** / **GPIO 18** | R\_PWM ≈ 1 kHz                        |
 | BTS7960 L\_EN / L\_PWM | **GPIO 23** / **GPIO 24** | L\_PWM는 항상 LOW                        |
+| SoftKill 버튼 입력      | **GPIO 10**               | active_low 옵션 지원                       |
+| SoftKill LED (R/G)     | **GPIO 09** / **GPIO 11** | led_active_high 옵션 지원                 |
+| PCA9685 /OE 제어       | **GPIO 22**               | 활성화 시 전체 채널 Enable/Disable          |
 | 3.3 V 로직               | —                         | PCA9685 VCC(로직)                       |
 | 5 V(서보)                | —                         | PCA9685 **V+** (외부 5 V, 1N5819 직렬 권장) |
 | 12 V(펠티어)              | —                         | BTS7960 VMOTOR, 입력에 470 µF//0.1 µF    |
+
 
 ### 배선 다이어그램(개요)
 
 ```plaintext
 [Raspberry Pi 5]
  ├─ I2C1 (GPIO2=SDA, GPIO3=SCL)
- │   └─ PCA9685 (VCC=3.3V, V+=5V 외부)
+ │   └─ PCA9685 (VCC=3.3V, V+=5V 외부, /OE: GPIO22)
  │       └─ Servo CH0..7 (외부 5V, 공통 GND)
  │
  ├─ PWM/EN (GPIO17,18,23,24)
@@ -220,7 +237,9 @@ sudo usermod -aG dialout $USER && newgrp dialout
  │       ├─ R_EN=GPIO17, R_PWM=GPIO18 (~1kHz)
  │       ├─ L_EN=GPIO23, L_PWM=GPIO24(LOW 고정)
  │       └─ VMOTOR=12V → Peltier (+)  /  GND 공통
- │
+ ├─ GPIO(SoftKill)
+ │   ├─ BUTTON (GPIO10, Active-Low)
+ │   └─ LED R/G (GPIO9/11, Active-High)
  └─ USB (CDC/ACM)
      └─ Arduino (팬/LED 브리지)
          ├─ D9 → 4핀 PWM 대형 팬(25kHz, Active-Low, 오픈드레인)
@@ -244,7 +263,7 @@ sudo usermod -aG dialout $USER && newgrp dialout
 * **전원**: `VCC=3.3 V`, `V+=외부 5 V` — 두 레일 **분리**(점퍼/브리지 제거)
 * **보호/안정화**: `V+`에 **1N5819 직렬** + `V+–GND`에 **470 µF//0.1 µF**
 * **I²C**: SDA/SCL에 3.3 V 풀업(보드 내장 가능), 라인당 **직렬 220 Ω** 권장
-* **/OE**(선택): 기본 HIGH(OFF) → 초기화 완료 후 LOW 활성화
+* **/OE**: 기본 HIGH(OFF) → 초기화 완료 후 LOW 활성화 (환경변수로 Enable/Disable 제어)
 * **버스/주소**: `/dev/i2c-1`, 기본 `0x60` (*보드에 따라 `0x40`일 수 있음 — 스캔 권장*)
 
 **핵심 함수**
@@ -262,6 +281,7 @@ sudo usermod -aG dialout $USER && newgrp dialout
 * 내부 4ch(0\~3): **θ → (60-θ)** 반전 적용
 * 외부 4ch(4\~7): 입력 그대로
 * 스레드 락으로 동시 호출 보호, `home_*`, `set_internal/external/both()` 제공
+* /OE 전체 Enable/Disable 지원(환경 변수로 핀/극성 지정)
 
 ---
 
@@ -314,7 +334,7 @@ sudo usermod -aG dialout $USER && newgrp dialout
 * 규칙: `v <= cold_high → 'B'`, `cold_high < v < hot_low → 'W'`, `v >= hot_low → 'R'`
 * 길이 4 강제(초과 버림·부족 0.0 패딩), `float()` 변환 실패 시 0.0 대체
 * 기본 임계값: `cold_high=-0.5`, `hot_low=+0.5`
-
+* LED_TSV_ORDER/LED_HW_ORDER로 입력/출력 채널 리맵 지원 (예: 대시보드 슬롯 순서 ≠ 하드 채널 순서일 때 매핑)
 **공개 API**: `LedService(...).preprocess(payload) -> List[str]`, `for_driver()`, `to_arduino_cmd()`, `to_status()`
 
 ---
@@ -407,11 +427,32 @@ ServoAPI().set_both(i4, e4)       # 내부 반전은 드라이버가 수행
 
 ### Main (`src/main.py`)
 
-**개요 — 임시 버전(펠티어 전용)**
+**개요 — 통합 제어 엔트리(최신)**
 
-* MQTT `control/hvac/{HVAC_ID}/value`의 `peltier_pwm`만 처리
-* 서비스 전처리(`PeltierService`) 후 BTS7960 드라이버에 듀티 적용
-* `tsv`, `temp_avg/target_temp_avg`는 **본 버전에서 무시**
+* 초기화 시:
+   1. BTS7960 안전 초기화(EN=LOW→정방향 Enable, 듀티=0)
+   2. ServoAPI OE Enable → home_all() 수행(부팅 기준자세)
+   3. Arduino(팬/LED) 연결
+   4. SoftKill 컨트롤러 초기화(물리 버튼/LED 연계), 콜백에서 안전 OFF/LED/서보 홈 일괄 처리
+
+* 구독/발행:
+   * 수신: .../value(펠티어/팬/서보), .../tsv(LED), .../power_server(SoftKill on/off)
+   * 발행: status/hvac/{id}/all (옵션: STATUS_USE_APPLIED에 따라 raw vs applied)
+
+* LED 채널 리맵: LED_TSV_ORDER(입력 정렬) → LED_HW_ORDER(물리채널 정렬)
+SoftKill 시 LED는 강제 OFF 색상으로 운용 (OFF 토큰 사용)
+
+* 서보 중복 호출 억제:
+전처리(클램프/라운딩) 후 이전 적용 상태와 SERVO_EPS_DEG 이내면 드라이버 호출 스킵
+(미세 떨림/과도 동작 억제)
+
+* SoftKill 전환 시 동작:
+   * OFF 진입: 펠티어 OFF, 팬 OFF, LED OFF, 서보 OE Enable → home_all() → OE Disable
+   * ON 복귀: 펠티어 Enable, 서보 OE Enable → home_all(), 최신 LED 매핑 재적용
+
+* 에너지 추정: utils/energy_meter.estimate_energy_wh_30s로 30초 가중치 기준 값 포함
+
+> **CLI (NO-MQTT)**로 동일 로직을 바로 테스트 가능: src/cli_actuator_test.py
 
 ```python
 #!/usr/bin/env python3
@@ -614,6 +655,18 @@ if __name__ == "__main__":
   * `MQTT_BROKER_PORT` (기본 `1883`)
   * `MQTT_KEEPALIVE` (기본 `60`)
   * `MQTT_QOS_DEFAULT` (기본 `0`)
+  * STATUS_USE_APPLIED: 1|0 — 상태 발행 시 보정값/수신값 선택
+  * LED_TSV_ORDER: 0,1,2,3 형태 — TSV 입력 슬롯→논리 슬롯 맵
+  * LED_HW_ORDER: 0,1,2,3 형태 — 논리 슬롯→물리 LED 채널 맵
+  * MIN_SMALL_FAN_ON: 소형 팬 최저 가동 듀티 (기본 30)
+  * SERVO_EPS_DEG: 서보 동일 판정 허용오차(deg, 기본 0.2)
+  * PCA9685_OE_GPIO: /OE 제어 GPIO 번호(미지정=-1)
+  * PCA9685_OE_ACTIVE_LOW: 1|0 (기본 1=Active-Low)
+  * PCA9685_OE_DEFAULT_ENABLE: 부팅시 Enable 여부(기본 0)
+  * GPIO_KILL_PIN: SoftKill 버튼 GPIO(미지정=-1)
+  * GPIO_KILL_ACTIVE_LOW: 1|0 (기본 1=Active-Low)=
+  * GPIO_LED_RED_PIN / GPIO_LED_GREEN_PIN: 상태 LED GPIO(미지정=-1)
+  * GPIO_LED_ACTIVE_HIGH: 1|0 (기본 1=Active-High)
 
 * **토픽 상수**
 
@@ -625,8 +678,8 @@ if __name__ == "__main__":
 
 * **구독 리스트** (`TOPICS_SUB`)
 
-  * `power_server`(서버 전원 제어): `{ "power":"on|off" }`
-  * `tsv`(TSV + 평균온도): `{ "temp_avg":.., "target_temp_avg":.., "tsv":[...4] }`
+  * `power_server`: { "power":"on|off" } → `SoftKill ON/OFF`
+  * `tsv`: { , ,"tsv":[...4] } → `LED 상태(대시보드 버튼/값)`
   * `value`(제어값): `peltier_pwm`, `internal_servo`, `external_servo`, `small_fan_pwm[4]`, `large_fan_pwm`
 
 * **발행 리스트** (`TOPICS_PUB`)
@@ -1126,3 +1179,76 @@ sudo systemctl status ssafy-motor.service
 
   * 길이4 강제 → `float()` 변환 → 채널별 0..MAX 클램프 → (옵션) 반올림 → 상태 보관
   * 내부 `60-θ` **반전 금지**(드라이버가 수행)
+
+---
+
+## 버튼 기반 제어(SoftKill/LED/Power)
+
+> 이 섹션은 새로 추가되었습니다. 물리 SoftKill 버튼과 대시보드의 LED 상태 버튼으로 Pi/Arduino를 제어하는 절차와 코드 흐름을 요약합니다.
+
+1) SoftKill (물리 버튼)
+* **GPIO 핀/극성**:
+   `GPIO_KILL_PIN`, `GPIO_KILL_ACTIVE_LOW`
+   `GPIO_LED_RED_PIN`, `GPIO_LED_GREEN_PIN`, `GPIO_LED_ACTIVE_HIGH`
+
+* **구현 위치**: `src/controls/softkill.py` + `src/main.py` 의 `_softkill_init()`/콜백
+
+* **상태 전환 동작**
+    * **OFF 진입(killed=True)**
+        1. 펠티어 듀티 0, EN LOW
+        2. 팬 0, LED는 `OFF` 강제
+        3. **서보 OE Enable** → `home_all()` → **OE Disable**
+    * **ON 복귀(killed=False)**
+        1. BTS7960 정방향 Enable
+        2. **서보 OE Enable** → `home_all()`
+        3. 최신 LED 매핑(TSV) 재적용
+    * **브로커 통지**: `control/hvac/{id}/power_actuator` 로 `{"power":"on|off"}` 발행
+
+2) **LED 상태 버튼(대시보드)**
+* **토픽**: `control/hvac/{HVAC_ID}/tsv`
+    페이로드: `{"tsv":[v1,v2,v3,v4]}` (`-3..+3` 범주)
+* **매핑 규칙**: `LedService.preprocess()`로 `['B'|'W'|'R']*4` 생성
+    → `LED_TSV_ORDER`로 입력 슬롯 정렬
+    → `LED_HW_ORDER`로 물리 채널 정렬
+
+* **SoftKill 연동**: killed=True 시 `OFF` 강제, 복귀 시 최신 색상으로 복원
+
+---
+
+## **CLI (NO-MQTT) — main 로직 직접 시험**
+
+> 새로운 개발용 도구입니다. MQTT 브로커 없이 main.py의 동일 로직을 그대로 태워 하드웨어를 시험합니다.
+
+* **파일**: `src/cli_actuator_test.py` 
+* 작동 원리
+    * `main._driver_init()`를 그대로 호출하여 **하드웨어 초기화**
+    * `DummyPublisher`로 `status/.../all` 출력은 콘솔에 표시
+    * 사용자의 CLI 명령을 `main.on_mqtt("<.../value|tsv|power_server>", payload)`로 **직접 투입**
+
+* **명령 예**
+```nginx
+peltier 45
+fans 30 40 0 0 60
+servo-both 0 0 0 0  10 20 30 40
+tsv 1.0 0 -1.2 0.6
+power off
+dump
+q
+```
+
+* 종료 시 main과 동일한 안전 종료(SoftKill=OFF 통지, 펠티어/팬/LED 정리)
+
+---
+
+## **변경 로그**
+
+**2025-08-18**
+
+* **LED 상태 버튼**(대시보드 → `.../tsv`) 추가, **입력/출력 채널 리맵**(`LED_TSV_ORDER`, `LED_HW_ORDER`) 반영
+* **SoftKill(물리 버튼)** 도입: 버튼/LED GPIO 연계, **OFF/ON 전환 시 서보** `home_all()` **시퀀스** 포함
+* **서보 중복 호출 억제**: `SERVO_EPS_DEG` 도입 — 이전 상태와 차이가 미세할 경우 드라이버 호출 생략
+* **PCA9685 /OE 제어** 옵션 추가: `PCA9685_OE_GPIO`, `PCA9685_OE_ACTIVE_LOW`, `PCA9685_OE_DEFAULT_ENABLE`
+* **CLI (NO-MQTT)** 추가: `src/cli_actuator_test.py` — main 로직을 브로커 없이 직접 시험
+* **상태 발행 모드**: `STATUS_USE_APPLIED`로 applied/raw 선택 가능
+* **에너지 추정**: `utils/energy_meter.py` 기반 **30초 Wh** 추정치 상태에 포함
+* 디렉토리/파일 구조 업데이트 반영 (`src/controls`, `src/utils` 등)

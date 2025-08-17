@@ -1,245 +1,223 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-cli_actuator_test.py
+cli_actuator_test.py (NO-MQTT, call main.py logic directly)
 ────────────────────────────────────────────────────────
-- MQTT 없이 로컬에서 액추에이터들을 각각 단독으로 테스트하는 CLI
-  1) Peltier PWM (BTS7960)
-  2) Servos (PCA9685) - 내부 4ch / 외부 4ch / 동시
-  3) Fans (Arduino via USB) - small 4 + large 1
-  4) TSV → LED 색상 매핑(Blue/White/Red) 후 Arduino에 전송
+- MQTT 브로커 없이 main.py 내부 로직을 그대로 태우는 CLI
+- 하는 일:
+    • main._driver_init() 호출 → 실제 하드웨어 드라이버 초기화(+서보 홈)
+    • main.mqttc 에 DummyPublisher 주입 → _publish_status() 출력 가시화
+    • 명령을 main.on_mqtt(".../value|tsv|power_server", payload) 로 직접 투입
+    • 종료 시 main 과 동일한 안전 종료 루틴 수행
 """
+
+from __future__ import annotations
 
 import sys
+import json
 import time
+import signal
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
-# --- sys.path 보정 ---
-SRC_DIR = Path(__file__).resolve().parent  # .../src
-ROOT_DIR = SRC_DIR.parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
+# --- sys.path 보정 (cli와 main이 같은 폴더라고 가정) ---
+SRC_DIR = Path(__file__).resolve().parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
-# ── 드라이버/서비스 임포트 ─────────────────────────────
-from actuators.services.peltier import PeltierService, MIN_ON_DUTY_DEFAULT
-from actuators.drivers.pca9685_servo_module import ServoAPI
-from actuators.drivers import bts7960_peltier_pwm as pdrv
+# main.py를 모듈로 사용 (여기서 드라이버/서비스/상태/콜백 전부 재사용)
+import main as app
 
-# Arduino Fan/LED 드라이버: arduino_bridge 우선, 없으면 구명칭으로 폴백
-try:
-    from actuators.drivers.arduino_bridge import ArduinoFanLedBridge as ArduinoFanLedClient
-except ModuleNotFoundError:
-    from actuators.drivers.arduino_fan_led import ArduinoFanLedClient  # 파일명이 다를 경우
+# ===== Dummy MQTT Publisher (status/알림을 콘솔로 표시) =====
+class DummyPublisher:
+    def __init__(self) -> None:
+        self.last = {}
 
+    def publish_json(self, topic: str, payload: dict) -> None:
+        self.last = {"topic": topic, "payload": payload}
+        print(f"[STATUS-PUB] {topic} {json.dumps(payload, ensure_ascii=False)}")
 
-# =====================================================
-# 0️⃣ 공통 유틸
-# =====================================================
-def _parse_int_list(prompt: str, n: int) -> List[int]:
-    while True:
-        try:
-            vals = list(map(int, input(prompt).strip().split()))
-            if len(vals) != n:
-                print(f"⚠ {n}개 정수를 공백으로 입력하세요.")
-                continue
-            return vals
-        except ValueError:
-            print("⚠ 숫자만 입력하세요.")
-
-def _parse_float_list(prompt: str, n: int) -> List[float]:
-    while True:
-        try:
-            vals = list(map(float, input(prompt).strip().split()))
-            if len(vals) != n:
-                print(f"⚠ {n}개 실수를 공백으로 입력하세요.")
-                continue
-            return vals
-        except ValueError:
-            print("⚠ 숫자만 입력하세요.")
-
-def _press_enter():
-    try:
-        input("↩ Enter 를 눌러 메뉴로 돌아가기...")
-    except KeyboardInterrupt:
+    # 인터페이스 호환용 (실제 동작은 안 함)
+    def set_message_handler(self, *_args, **_kwargs):
+        pass
+    def connect(self, *_args, **_kwargs):
+        pass
+    def disconnect(self):
         pass
 
+# ===== 입력 파서 =====
+def _ints(xs: List[str]) -> List[int]:
+    out: List[int] = []
+    for s in xs:
+        try: out.append(int(float(s)))
+        except: out.append(0)
+    return out
 
-# =====================================================
-# 1️⃣ Peltier(펠티어) 테스트
-# =====================================================
-def test_peltier(svc: PeltierService):
-    print("\n[Peltier] 0은 OFF, 1~100은 서비스 매핑(MIN_ON~100) 후 적용됩니다.")
-    while True:
-        s = input("듀티(0~100, 종료:q): ").strip().lower()
-        if s in ("q", "quit", "exit"):
-            break
-        try:
-            raw = int(s)
-        except ValueError:
-            print("⚠ 숫자를 입력하세요.")
-            continue
-        applied = svc.preprocess({"peltier_pwm": raw})
-        pdrv.set_duty(applied)
-        print(f"raw={raw} → applied={applied}")
+def _floats(xs: List[str]) -> List[float]:
+    out: List[float] = []
+    for s in xs:
+        try: out.append(float(s))
+        except: out.append(0.0)
+    return out
 
+def _help() -> None:
+    print(r"""
+================= CLI (NO MQTT) =================
+main.py의 on_mqtt 로직을 직접 호출해 테스트합니다.
 
-# =====================================================
-# 2️⃣ Servo(서보) 테스트
-#   - 내부 4ch: 입력 θ → (60-θ) 반전 (드라이버 내부 처리)
-#   - 외부 4ch: 입력 그대로
-# =====================================================
-def test_servo_internal(servo: ServoAPI):
-    print("\n[Servo] 내부 4채널 각도를 입력하세요. 예) 0 10 20 30")
-    angles = _parse_float_list("internal(4개, deg): ", 4)
-    servo.set_internal(angles)
-    print("✓ 내부 적용 완료")
-    _press_enter()
+명령어:
+  peltier <duty>                       예) peltier 45
+  fans <f1> <f2> <f3> <f4> <big>       예) fans 30 40 0 0 60
+  fan-small <f1> <f2> <f3> <f4>        예) fan-small 10 10 0 0
+  fan-main <big>                       예) fan-main 70
+  servo-int  <4개 각도>                예) servo-int 0 10 20 30
+  servo-ext  <4개 각도>                예) servo-ext 15 25 35 45
+  servo-both <내부4> <외부4>           예) servo-both 0 0 0 0  10 20 30 40
+  tsv <v1> <v2> <v3> <v4>              예) tsv 1.0 0 -1.2 0.6
+  value <JSON>                         예) value {"peltier_pwm":55,"fan_main_pwm":70}
+  power on|off                         예) power off
+  status                                현재 상태를 강제로 출력
+  dump                                  raw_cmd/state/softkill 덤프
+  sleep <sec>                           잠깐 대기
+  q|quit|exit                           종료
+=================================================
+""".strip())
 
-def test_servo_external(servo: ServoAPI):
-    print("\n[Servo] 외부 4채널 각도를 입력하세요. 예) 15 25 35 45")
-    angles = _parse_float_list("external(4개, deg): ", 4)
-    servo.set_external(angles)
-    print("✓ 외부 적용 완료")
-    _press_enter()
+# ===== on_mqtt 에 투입할 토픽 문자열 (endswith 로만 판별하므로 내용은 임의) =====
+TOP_VALUE = f"control/hvac/{getattr(app, 'HVAC_ID', 1)}/value"
+TOP_TSV   = f"control/hvac/{getattr(app, 'HVAC_ID', 1)}/tsv"
+TOP_PWR   = f"control/hvac/{getattr(app, 'HVAC_ID', 1)}/power_server"
 
-def test_servo_both(servo: ServoAPI):
-    print("\n[Servo] 내부/외부 각도 4개씩 입력. 예) 내부: 0 0 0 0 / 외부: 10 20 30 40")
-    i = _parse_float_list("internal(4개, deg): ", 4)
-    e = _parse_float_list("external(4개, deg): ", 4)
-    servo.set_both(i, e)
-    print("✓ 내부+외부 동시 적용 완료")
-    _press_enter()
+# ===== 한 줄 처리 =====
+def handle(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    parts = s.split()
+    cmd, args = parts[0].lower(), parts[1:]
 
-
-# =====================================================
-# 3️⃣ Fan(팬) 테스트 (Arduino)
-#   - small_fan_pwm = 4개, large_fan_pwm = 1개 → SETF f1 f2 f3 f4 big
-# =====================================================
-def test_fans(ardu: ArduinoFanLedClient | None):
-    if not ardu:
-        print("⚠ Arduino 미연결 상태입니다. USB 연결/권한 확인 후 다시 시도하세요.")
-        _press_enter()
-        return
-    print("\n[Fans] 작은 팬 4개 + 대형 1개 듀티(0~100)를 입력. 예) 100 80 70 50 90")
-    vals = _parse_int_list("f1 f2 f3 f4 big: ", 5)
-    ack = ardu.set_fans(vals)
-    print("→", ack)
-    _press_enter()
-
-
-# =====================================================
-# 4️⃣ TSV → LED 매핑 테스트 (Arduino)
-#   - 규칙: tsv ∈ [-3,3]
-#       tsv < -0.5  → Blue
-#       -0.5~0.5    → White
-#       tsv > 0.5   → Red
-#   - 4개 TSV를 받아 4개 LED 색으로 전송
-# =====================================================
-def _tsv_to_color(v: float) -> str:
-    if v < -0.5:
-        return "B"
-    if v > 0.5:
-        return "R"
-    return "W"
-
-def test_led_from_tsv(ardu: ArduinoFanLedClient | None):
-    if not ardu:
-        print("⚠ Arduino 미연결 상태입니다. USB 연결/권한 확인 후 다시 시도하세요.")
-        _press_enter()
-        return
-    print("\n[LED] TSV 4개(-3~3)를 입력하세요. 예) 1.0 0.0 -1.2 0.6")
-    tsv = _parse_float_list("tsv[4]: ", 4)
-    cols = [_tsv_to_color(v) for v in tsv]  # ['R'|'B'|'W']
-    print("→ LED Colors:", cols)
-    ack = ardu.set_leds(cols)
-    print("→", ack)
-    _press_enter()
-
-
-# =====================================================
-# 5️⃣ 메뉴 루프
-# =====================================================
-MENU = """
-================= CLI Actuator Test =================
- 1) Peltier PWM (BTS7960)
- 2) Servo Internal  (4ch)
- 3) Servo External  (4ch)
- 4) Servo Both      (8ch)
- 5) Fans            (small x4 + large x1)
- 6) LED from TSV    (4개의 TSV → LED 색 매핑 전송)
- 7) Arduino GET?    (현재 상태 읽기)
- q) Quit
-=====================================================
-"""
-
-def main():
-    # ── 드라이버 초기화 ──
-    # Peltier
-    pdrv.safe_init()
-    pdrv.enable_forward()
-    pdrv.set_duty(0)
-    svc = PeltierService(min_on_duty=MIN_ON_DUTY_DEFAULT, rounding="floor")
-
-    # Servo
-    servo = ServoAPI(home=False)  # 필요 시 home=True로 부팅시 홈 스윕
-
-    # Arduino(Fan/LED)
-    ardu: ArduinoFanLedClient | None = None
     try:
-        ardu = ArduinoFanLedClient()
-        # arduino_bridge 기반 클래스는 connect()가 필요
-        if hasattr(ardu, "connect"):
-            ardu.connect()
-        print("✅ Arduino 연결 완료.")
+        if cmd in ("q", "quit", "exit"):
+            return False
+        if cmd in ("h", "help", "?"):
+            _help(); return True
+
+        # ---- /value 계열 ----
+        if cmd == "peltier" and len(args) == 1:
+            duty = int(float(args[0]))
+            app.on_mqtt(TOP_VALUE, {"peltier_pwm": duty})
+            return True
+
+        if cmd == "fans" and len(args) == 5:
+            f1, f2, f3, f4, big = _ints(args)
+            app.on_mqtt(TOP_VALUE, {"small_fan_pwm": [f1, f2, f3, f4], "fan_main_pwm": big})
+            return True
+
+        if cmd == "fan-small" and len(args) == 4:
+            f1, f2, f3, f4 = _ints(args)
+            app.on_mqtt(TOP_VALUE, {"small_fan_pwm": [f1, f2, f3, f4]})
+            return True
+
+        if cmd == "fan-main" and len(args) == 1:
+            big = int(float(args[0]))
+            app.on_mqtt(TOP_VALUE, {"fan_main_pwm": big})
+            return True
+
+        if cmd == "servo-int" and len(args) == 4:
+            app.on_mqtt(TOP_VALUE, {"internal_servo": _floats(args)})
+            return True
+
+        if cmd == "servo-ext" and len(args) == 4:
+            app.on_mqtt(TOP_VALUE, {"external_servo": _floats(args)})
+            return True
+
+        if cmd == "servo-both" and len(args) == 8:
+            i = _floats(args[:4]); e = _floats(args[4:])
+            app.on_mqtt(TOP_VALUE, {"internal_servo": i, "external_servo": e})
+            return True
+
+        if cmd == "value":
+            # 공백 뒤 JSON 전체를 파싱
+            js = s[len("value"):].strip()
+            payload = json.loads(js) if js else {}
+            if not isinstance(payload, dict):
+                raise ValueError('JSON 오브젝트를 입력하세요. 예) value {"peltier_pwm":55}')
+            app.on_mqtt(TOP_VALUE, payload)
+            return True
+
+        # ---- /tsv → LED ----
+        if cmd == "tsv" and len(args) == 4:
+            app.on_mqtt(TOP_TSV, {"tsv": _floats(args)})
+            return True
+
+        # ---- /power_server (softkill) ----
+        if cmd == "power" and len(args) == 1:
+            v = args[0].lower()
+            if v not in ("on","off","1","0","true","false"):
+                raise ValueError("power on|off 로 입력하세요.")
+            app.on_mqtt(TOP_PWR, {"power": v})
+            return True
+
+        # ---- 상태/디버그 ----
+        if cmd == "status":
+            app._publish_status()  # DummyPublisher가 콘솔로 출력
+            return True
+
+        if cmd == "dump":
+            print("raw_cmd :", getattr(app, "raw_cmd", {}))
+            print("state   :", getattr(app, "state", {}))
+            print("softkill:", getattr(app, "_softkill_killed", False))
+            return True
+
+        if cmd == "sleep" and len(args) == 1:
+            sec = float(args[0]); print(f"(sleep {sec}s)"); time.sleep(sec); return True
+
+        print("⚠ 알 수 없는 명령이거나 인자 개수가 맞지 않습니다. help 로 도움말을 보세요.")
     except Exception as e:
-        print(f"⚠ Arduino 연결 생략(오류): {e}")
-        ardu = None
+        print(f"❗ 오류: {e}")
+    return True
 
-    print("✅ 초기화 완료. 장치 준비됨.\n")
-    while True:
-        try:
-            print(MENU)
-            sel = input("> ").strip().lower()
-            if sel in ("q", "quit", "exit"):
-                break
-            elif sel == "1":
-                test_peltier(svc)
-            elif sel == "2":
-                test_servo_internal(servo)
-            elif sel == "3":
-                test_servo_external(servo)
-            elif sel == "4":
-                test_servo_both(servo)
-            elif sel == "5":
-                test_fans(ardu)
-            elif sel == "6":
-                test_led_from_tsv(ardu)
-            elif sel == "7":
-                if ardu:
-                    try:
-                        print("→", ardu.get_state())
-                    except AttributeError:
-                        print("⚠ 드라이버에 get_state()가 없습니다.")
-                else:
-                    print("⚠ Arduino 미연결 상태입니다.")
-                _press_enter()
-            elif sel == "":
-                continue
-            else:
-                print("⚠ 메뉴를 다시 선택하세요.")
-        except KeyboardInterrupt:
-            print("\n⛔ 사용자 종료")
-            break
-        except Exception as e:
-            print(f"❗ 오류: {e}")
+# ===== 종료 핸들러 =====
+def _on_signal(signum, frame):
+    print("\n🔚 종료 신호 수신. 정리 중...")
 
-    # ── 종료 처리 ──
+# ===== main =====
+def main():
+    # 1) main 드라이버 초기화(+서보 홈) & Dummy MQTT 주입
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    print("⚙️  드라이버 초기화(main._driver_init) ...")
+    app._driver_init()             # main과 동일: 펠티어/서보/아두이노 초기화 + 서보 home_all()
+    app.mqttc = DummyPublisher()   # 상태 발행을 콘솔로 보기 위함
+
+    print("✅ 준비 완료. 하드웨어는 main.py와 동일 로직으로 제어됩니다.")
+    _help()
+
+    # 2) REPL
     try:
-        pdrv.set_duty(0)
-    except Exception:
+        while True:
+            line = input("> ")
+            if not handle(line):
+                break
+    except (EOFError, KeyboardInterrupt):
         pass
-    print("✅ 종료: Peltier PWM=0, 기타 리소스 정리 완료.")
+    finally:
+        # main.py 와 동일한 종료 루틴
+        try:
+            if getattr(app, "softkill", None):
+                app.softkill.set_state(True, emit=True, reason="shutdown")
+        except Exception:
+            pass
+        try:
+            app._driver_safe_off()
+            try:
+                if hasattr(app, "_ardu_send_leds"):
+                    app._ardu_send_leds(["OFF","OFF","OFF","OFF"])  # LED를 OFF로 유지
+            except Exception:
+                pass
+        finally:
+            print("✅ Clean exit.")
 
 if __name__ == "__main__":
     main()

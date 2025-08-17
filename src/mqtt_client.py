@@ -22,6 +22,9 @@ mqttc.connect(keepalive=60)
 
 # 상태 발행
 mqttc.publish_json("status/hvac/1/all", {"hvac_id": 1, "data": {...}})
+
+# 전용 전원상태 발행
+mqttc.publish_power_state("off", source="button")  # {"hvac_id": N, "power": "off", "source": "button"}
 """
 
 from __future__ import annotations
@@ -51,6 +54,17 @@ def _normalize_topics(
         else:
             norm.append((str(t), 0))
     return norm
+
+
+def _coerce_power(x: Any) -> str:
+    """여러 값(on/1/True/off/0/False/공백 등)을 'on'/'off'로 정규화."""
+    s = str(x).strip().lower()
+    if s in ("1", "true", "on", "t", "yes", "y"):
+        return "on"
+    if s in ("0", "false", "off", "f", "no", "n", ""):
+        return "off"
+    # 예외 입력은 그대로 넣되 로그에 보이도록 유지
+    return s or "off"
 
 
 # =====================================================
@@ -172,6 +186,45 @@ class MQTTClient:
     def publish_json(self, topic: str, payload: dict, qos: int = 0, retain: bool = False) -> None:
         """dict → JSON 직렬화 후 발행"""
         self.publish_raw(topic, json.dumps(payload, ensure_ascii=False), qos=qos, retain=retain)
+
+    def publish_power_state(
+        self,
+        power: Any,
+        *,
+        source: Optional[str] = None,
+        hvac_id: Optional[int] = None,
+        topic: Optional[str] = None,
+        qos: Optional[int] = None,
+        retain: bool = False,
+    ) -> None:
+        """
+        전원상태 전용 헬퍼.
+        Args:
+            power: 'on'|'off' 또는 bool/int 등 → on/off로 정규화
+            source: "button"|"remote" 등 (옵션)
+            hvac_id: 없으면 config.HVAC_ID 사용
+            topic:  없으면 config.TOPIC_POWER_ACTUATOR 사용
+            qos:    지정 없으면 0
+            retain: 대시보드 초기 동기화용으로 True 사용 가능
+        """
+        # config에서 기본값 읽기 (순환 의존 방지: 지연 import)
+        if hvac_id is None or topic is None:
+            try:
+                from config import HVAC_ID as _ID, TOPIC_POWER_ACTUATOR as _TOPIC
+                if hvac_id is None:
+                    hvac_id = int(_ID)
+                if topic is None:
+                    topic = _TOPIC
+            except Exception:
+                # config가 없거나 상수가 누락된 경우의 안전 폴백
+                hvac_id = hvac_id if hvac_id is not None else 1
+                topic = topic or f"control/hvac/{hvac_id}/power_actuator"
+
+        payload: Dict[str, Any] = {"hvac_id": hvac_id, "power": _coerce_power(power)}
+        if source:
+            payload["source"] = str(source)
+
+        self.publish_json(topic, payload, qos=(qos if qos is not None else 0), retain=retain)
 
     # -------------------------------------------------
     # 최신 스냅샷/헬퍼

@@ -30,38 +30,6 @@
     - 공통 캐소드 LED: 각 R/G/B에 220~330Ω 직렬저항, 캐소드는 GND
 */
 
-/*
-  multi_fan_led_serial_control.ino
-  ────────────────────────────────────────────────────────
-  - 라즈베리파이 USB 시리얼 명령으로 5개 팬(0~100%) + 3색 LED 4개 제어
-  - 팬 핀:
-      BIG(4핀 PWM) = D9 (OC1A, Timer1, 25kHz, Active-Low 듀티 반전)
-      MOSFET CH1..CH4 = D3, D5, D6, D11 (PWM)
-  - LED 핀 (공통 캐소드, 실제 배선 RGB):
-      LED1: R=D2,  G=D7,  B=D4
-      LED2: R=D8,  G=D12, B=D10
-      LED3: R=A0,  G=A2,  B=A1
-      LED4: R=A3,  G=A5,  B=A4
-
-  - 프로토콜(개행 '\n' 종료):
-      SETF <f1> <f2> <f3> <f4> <big>         → 팬 5개 동시 갱신 (0~100)
-      SETL <c1> <c2> <c3> <c4>               → LED 4개 색상 (R|G|B|W|OFF)
-      SETALL <f1> <f2> <f3> <f4> <big> <c1> <c2> <c3> <c4>   → 원샷 갱신 (옵션)
-      GET?                                    → 현재 상태 보고
-    * 응답:
-      ACK:SETF:f1,f2,f3,f4,big
-      ACK:SETL:c1,c2,c3,c4
-      ACK:SETALL:f1,f2,f3,f4,big;c1,c2,c3,c4
-      DATA:STATE:F:f1,f2,f3,f4,big;L:c1,c2,c3,c4
-
-  - 오류:
-      ERR:BAD_ARGS / ERR:OUT_OF_RANGE / ERR:BAD_COLOR / ERR:UNKNOWN_CMD
-
-  ⚠ 하드웨어 주의:
-    - 4핀 팬 PWM(D9)은 오픈드레인/오픈컬렉터(2N7000 등)로 GND로만 당김 권장
-    - 공통 캐소드 LED: 각 R/G/B에 220~330Ω 직렬저항, 캐소드는 GND
-*/
-
 #include <Arduino.h>
 
 // ===== Fan pins =====
@@ -286,3 +254,4 @@ void loop() {
 
   Serial.println(F("ERR:UNKNOWN_CMD"));
 }
+

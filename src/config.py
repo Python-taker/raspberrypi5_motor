@@ -52,15 +52,13 @@ import os
 # =====================================================
 HVAC_ID: int = int(os.getenv("HVAC_ID", "1"))
 
-# MQTT 브로커(메인에서 필요 시 import 해서 사용)
 BROKER_HOST: str = os.getenv("MQTT_BROKER_HOST", "localhost")
 BROKER_PORT: int = int(os.getenv("MQTT_BROKER_PORT", "1883"))
 MQTT_KEEPALIVE: int = int(os.getenv("MQTT_KEEPALIVE", "60"))
 
-# QoS 기본값 (팀 규약상 0)
 QOS_DEFAULT: int = int(os.getenv("MQTT_QOS_DEFAULT", "0"))
 
-# ✅ 상태 발행 시, 적용값을 보낼지 여부 (기본 True)
+# ✅ 상태 발행 시, 보정된 값(적용값)을 보낼지 여부 (기본 True)
 STATUS_USE_APPLIED: bool = os.getenv("STATUS_USE_APPLIED", "true").strip().lower() in (
     "1", "true", "t", "yes", "y", "on"
 )
@@ -73,64 +71,70 @@ TOPIC_POWER_ACTUATOR  = f"control/hvac/{HVAC_ID}/power_actuator"
 
 TOPIC_POWER_SERVER    = f"control/hvac/{HVAC_ID}/power_server"
 TOPIC_TSV             = f"control/hvac/{HVAC_ID}/tsv"
-TOPIC_TSV_STATUS      = f"status/hvac/{HVAC_ID}/tsv"   # ← 추가: 일부 발행측이 status/.../tsv 사용
+TOPIC_TSV_STATUS      = f"status/hvac/{HVAC_ID}/tsv"
 TOPIC_VALUE           = f"control/hvac/{HVAC_ID}/value"
 
 # =====================================================
-# 3️⃣ MQTT 구독(Subscribe) 토픽 리스트
-#    paho-mqtt Client.subscribe([(topic, qos), ...]) 형태와 호환
+# 3️⃣ MQTT 구독/발행 리스트
 # =====================================================
 TOPICS_SUB = [
-    (TOPIC_POWER_SERVER, QOS_DEFAULT),  # 서버 전원 제어: {"power":"on|off"}
-    (TOPIC_TSV,          QOS_DEFAULT),  # TSV + temp_avg/target_temp_avg + 벡터 (control)
-    (TOPIC_TSV_STATUS,   QOS_DEFAULT),  # TSV + ... (status)  ← 추가
-    (TOPIC_VALUE,        QOS_DEFAULT),  # 제어값: 팬/서보/펠티어 등
+    (TOPIC_POWER_SERVER, QOS_DEFAULT),
+    (TOPIC_TSV,          QOS_DEFAULT),
+    (TOPIC_TSV_STATUS,   QOS_DEFAULT),
+    (TOPIC_VALUE,        QOS_DEFAULT),
 ]
 
-# =====================================================
-# 4️⃣ MQTT 발행(Publish) 토픽 리스트
-# =====================================================
 TOPICS_PUB = [
-    (TOPIC_STATUS_ALL,     QOS_DEFAULT),  # 액추에이터 상태값 종합
-    (TOPIC_POWER_ACTUATOR, QOS_DEFAULT),  # 라즈베리파이 측 전원 상태 회신
+    (TOPIC_STATUS_ALL,     QOS_DEFAULT),
+    (TOPIC_POWER_ACTUATOR, QOS_DEFAULT),
 ]
 
-
 # =====================================================
-# 1-추가) LED 인덱스 매핑 (ENV로 관리)
-#  - LED_TSV_ORDER:  들어온 TSV의 인덱스 → "논리 슬롯" 인덱스
-#  - LED_HW_ORDER:   논리 슬롯 인덱스 → "아두이노 물리 채널" 인덱스
-#  예: "2,0,3,1"  ← 길이 4, 0~3의 순열이어야 함
+# 4️⃣ LED 인덱스 매핑
 # =====================================================
 def _parse_order_map(env_name: str, default_csv: str = "0,1,2,3") -> list[int]:
-    """
-    '0,1,2,3' 형태 ENV를 [0,1,2,3] 리스트로 파싱.
-    - 길이 != 4, 중복/범위 오류가 있으면 identity로 대체.
-    """
     raw = os.getenv(env_name, default_csv).replace(" ", "")
     try:
         arr = [int(x) for x in raw.split(",") if x != ""]
     except Exception:
         arr = [0, 1, 2, 3]
     if len(arr) != 4 or sorted(arr) != [0, 1, 2, 3]:
-        print(f"[config][Warn] {env_name}={raw} 가 유효한 순열이 아님 → [0,1,2,3] 사용")
+        print(f"[config][Warn] {env_name}={raw} 가 유효하지 않음 → [0,1,2,3] 사용")
         arr = [0, 1, 2, 3]
     return arr
 
 LED_TSV_ORDER: list[int] = _parse_order_map("LED_TSV_ORDER", "0,1,2,3")
 LED_HW_ORDER:  list[int] = _parse_order_map("LED_HW_ORDER",  "2,0,3,1")
 
+# =====================================================
+# 5️⃣ 소프트-Kill 버튼 & 상태 LED 핀
+# =====================================================
+# 버튼: GPIO_KILL_PIN (토글 동작)
+GPIO_KILL_PIN: int = int(os.getenv("GPIO_KILL_PIN", "-1"))  # -1이면 비활성화
+GPIO_KILL_ACTIVE_LOW: bool = os.getenv("GPIO_KILL_ACTIVE_LOW", "1") in ("1", "true", "True")
+GPIO_KILL_DEBOUNCE_MS: int = int(os.getenv("GPIO_KILL_DEBOUNCE_MS", "120"))
+
+# LED: 공통 캐소드/애노드 여부에 따라 ACTIVE_HIGH 조정
+GPIO_LED_RED_PIN: int   = int(os.getenv("GPIO_LED_RED_PIN", "-1"))
+GPIO_LED_GREEN_PIN: int = int(os.getenv("GPIO_LED_GREEN_PIN", "-1"))
+GPIO_LED_ACTIVE_HIGH: bool = os.getenv("GPIO_LED_ACTIVE_HIGH", "1") in ("1", "true", "True")
+# ACTIVE_HIGH=True → HIGH=켜짐 / False → LOW=켜짐
+
+# =====================================================
+# __all__ 공개 API
+# =====================================================
 __all__ = [
     # 브로커/공통
     "BROKER_HOST", "BROKER_PORT", "MQTT_KEEPALIVE",
-    "HVAC_ID", "QOS_DEFAULT",
-    "STATUS_USE_APPLIED",                     # ★ 추가
-    # 토픽 상수
+    "HVAC_ID", "QOS_DEFAULT", "STATUS_USE_APPLIED",
+    # 토픽
     "TOPIC_STATUS_ALL", "TOPIC_POWER_ACTUATOR",
     "TOPIC_POWER_SERVER", "TOPIC_TSV", "TOPIC_TSV_STATUS", "TOPIC_VALUE",
-    "TOPIC_POWER_SERVER", "TOPIC_TSV", "TOPIC_VALUE",
     # 리스트
     "TOPICS_SUB", "TOPICS_PUB",
     # LED 위치 보정
     "LED_TSV_ORDER", "LED_HW_ORDER",
+    # 소프트킬/LED
+    "GPIO_KILL_PIN", "GPIO_KILL_ACTIVE_LOW", "GPIO_KILL_DEBOUNCE_MS",
+    "GPIO_LED_RED_PIN", "GPIO_LED_GREEN_PIN", "GPIO_LED_ACTIVE_HIGH",
 ]
