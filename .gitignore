@@ -1,10 +1,9 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-#.env
+.env
 pytest_cache/
 .mypy_cache/
 .coverage
@@ -22,4 +21,24 @@ dist/
 backups/
 *.tar.gz
 arduino/*.hex
-EOF
+
+# ── 추가: 스샷에 나온 것들 숨김 ──────────────────────────────
+# 1) Arduino 백업 스케치
+arduino/*_backup.ino
+# (오타 케이스도 커버: contorl_backup 같은 파일)
+arduino/*contorl*_backup.ino
+
+# 2) 임시/실험용 상위 폴더
+comm/
+motor_project/
+
+# 3) 개발용 보조 스크립트(로컬 테스트 전용)
+src/scripts/gpio_toggler.py
+src/scripts/mqtt_sniff.py
+
+# 4) 로컬 테스트 코드 모음
+test_code/
+
+# 5) 스샷에 보이던 임시/미상태 파일들(.lgd-*, _lgd-*)
+**/.lgd-*
+**/_lgd-*

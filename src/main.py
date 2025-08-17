@@ -465,7 +465,7 @@ def _apply_servos(internal4: List[float] | None, external4: List[float] | None) 
     if internal4 is not None:
         state["servo_internal"] = new_i
     if external4 is not None:
-        state["servo_external"] = new_eW
+        state["servo_external"] = new_e
 
 def _apply_peltier(raw_pwm: Any) -> None:
     if raw_pwm is None:
