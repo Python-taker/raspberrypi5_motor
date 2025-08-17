@@ -44,6 +44,85 @@ from scipy.interpolate import interp1d
 import time
 from typing import List
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# [추가] OE 제어 관련 (환경변수 + RPi.GPIO 선택적 사용)
+import os
+try:
+    import RPi.GPIO as _GPIO  # type: ignore
+    _GPIO_OK = True
+except Exception:
+    _GPIO_OK = False
+
+# 환경변수: GPIO 번호, Active-Low 여부, 초기 기본 상태(Enable 여부)
+_PCA9685_OE_GPIO = int(os.getenv("PCA9685_OE_GPIO", "-1"))          # 예: 22
+_PCA9685_OE_ACTIVE_LOW = os.getenv("PCA9685_OE_ACTIVE_LOW", "1").lower() in ("1","true","t","yes","y","on")
+_PCA9685_OE_DEFAULT_ENABLE = os.getenv("PCA9685_OE_DEFAULT_ENABLE", "0").lower() in ("1","true","t","yes","y","on")
+
+# 내부 상태
+__oe_ready = False
+__oe_enabled = False
+
+def _oe_level(enable: bool) -> int:
+    """
+    enable=True  → 출력 활성 상태가 되도록 레벨 반환
+    /OE는 Active-Low(기본) → enable=True면 GPIO LOW
+    """
+    on = bool(enable)
+    if _PCA9685_OE_ACTIVE_LOW:
+        # Active-Low: LOW=Enable, HIGH=Disable
+        return _GPIO.LOW if on else _GPIO.HIGH
+    else:
+        # Active-High 가정 (특수 케이스)
+        return _GPIO.HIGH if on else _GPIO.LOW
+
+def _oe_setup_if_needed() -> None:
+    global __oe_ready, __oe_enabled
+    if not _GPIO_OK or _PCA9685_OE_GPIO < 0 or __oe_ready:
+        return
+    try:
+        _GPIO.setmode(_GPIO.BCM)
+        # 초기 상태: 환경변수대로
+        init_level = _oe_level(_PCA9685_OE_DEFAULT_ENABLE)
+        _GPIO.setup(_PCA9685_OE_GPIO, _GPIO.OUT, initial=init_level)
+        __oe_ready = True
+        __oe_enabled = bool(_PCA9685_OE_DEFAULT_ENABLE)
+        print(f"✅ PCA9685 /OE on BCM{_PCA9685_OE_GPIO} "
+              f"(active_low={_PCA9685_OE_ACTIVE_LOW}, default_enable={__oe_enabled})")
+    except Exception as e:
+        print(f"⚠ PCA9685 /OE GPIO 초기화 실패: {e}")
+
+def enable_outputs() -> None:
+    """PCA9685 전체 출력 Enable (/OE 적절 레벨로 구동)."""
+    global __oe_enabled
+    if not _GPIO_OK or _PCA9685_OE_GPIO < 0:
+        # NOOP
+        __oe_enabled = True
+        return
+    _oe_setup_if_needed()
+    try:
+        _GPIO.output(_PCA9685_OE_GPIO, _oe_level(True))
+        __oe_enabled = True
+    except Exception as e:
+        print(f"⚠ enable_outputs 실패: {e}")
+
+def disable_outputs() -> None:
+    """PCA9685 전체 출력 Disable."""
+    global __oe_enabled
+    if not _GPIO_OK or _PCA9685_OE_GPIO < 0:
+        # NOOP
+        __oe_enabled = False
+        return
+    _oe_setup_if_needed()
+    try:
+        _GPIO.output(_PCA9685_OE_GPIO, _oe_level(False))
+        __oe_enabled = False
+    except Exception as e:
+        print(f"⚠ disable_outputs 실패: {e}")
+
+def oe_is_enabled() -> bool:
+    """현재 논리 상태 추정(하드 읽기 대신 내부 상태 플래그 사용)."""
+    return bool(__oe_enabled)
+
 # ───── 실측 기반 상수 ────────────────────────────────
 PWM_HOME = 150              # 0 deg 기준 펄스
 MOVE_MAXIMUM_ANGLE_LIST = [60, 60, 60, 60, 80, 80, 80, 80]
@@ -165,19 +244,22 @@ def init_pca9685(address: int = 0x60, freq: int = 50):
     # ---------------------------------------------------
 
     last_err = None
-    # 주소 0x60 우선, 실패 시 0x40 재시도
     for addr in (address, 0x40 if address != 0x40 else 0x60):
         try:
-            # ✅ CircuitPython PCA9685: 첫 인자는 위치 인자로 I2C 버스 전달
             _cp = _CP_PCA9685(i2c, address=addr)
             _cp.frequency = freq
             print(f"✅ PCA9685 초기화 완료 (0x{addr:X}, {freq} Hz)")
+            # [추가] /OE 핀 초기화(필요 시)
+            _oe_setup_if_needed()
+            # 초기 기본 상태 적용(환경변수)
+            if _PCA9685_OE_DEFAULT_ENABLE:
+                enable_outputs()
+            else:
+                disable_outputs()
             return _CompatPCA9685(_cp)
         except Exception as e:
             last_err = e
             continue
-
-    # 둘 다 실패 시 마지막 예외 전파
     raise last_err
 
 
@@ -475,6 +557,8 @@ def safe_corrective_move(
 #   - 채널 매핑: 0~3=internal, 4~7=external
 # =====================================================
 
+import threading
+
 INTERNAL_CHANNELS = [0, 1, 2, 3]
 EXTERNAL_CHANNELS = [4, 5, 6, 7]
 
@@ -489,8 +573,6 @@ def _apply_angle(pwm, channel: int, positions: list, angle_deg: float) -> None:
     """안전 보정 이동(safe_corrective_move)로 1채널 적용."""
     angle_deg = _clamp_angle_for_channel(channel, angle_deg)
     safe_corrective_move(pwm, channel, positions, angle_deg)
-
-import threading
 
 class ServoAPI:
     """
@@ -573,6 +655,14 @@ class ServoAPI:
             pass  # Adafruit_PCA9685는 명시적 종료 API 없음
         except Exception:
             pass
+        
+    # ---- [추가] /OE 제어 얇은 래퍼 ----
+    def global_enable_outputs(self) -> None:
+        enable_outputs()
+    def global_disable_outputs(self) -> None:
+        disable_outputs()
+    def oe_is_enabled(self) -> bool:
+        return oe_is_enabled()
 
 # =====================================================
 # 7️⃣ CLI ─ 단독 테스트용 진입점

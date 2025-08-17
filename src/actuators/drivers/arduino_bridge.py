@@ -64,7 +64,11 @@ class ArduinoFanLedBridge:
         set_fans([f1,f2,f3,f4,big]) -> str(ACK)
         set_leds([c1,c2,c3,c4]) -> str(ACK)   # c∈{R,G,B,W,OFF}
         set_all(fans, leds) -> str(ACK)
-        get_state() -> dict  # {"ch1":int,...,"big":int,"raw":"..."}
+        all_off() -> str(ACK)                 # 팬=0, LED=OFF
+        safe_all_off() -> bool                # 예외 삼켜서 성공/실패만
+        set_tsv([t1,t2,t3,t4]) -> str(ACK)    # 선택(펌웨어 지원 시)
+        get_state() -> dict
+        apply_from_value_payload(value, led_colors=None) -> str
     """
 
     # =================================================
@@ -102,13 +106,12 @@ class ArduinoFanLedBridge:
         # 초기 버퍼 정리
         self.ser.reset_input_buffer()
         self.ser.reset_output_buffer()
-
-        # READY 대기
+        
+        # READY가 온다면 소거해서 버퍼 깨끗이
         t_end = time.time() + self.timeout
         while time.time() < t_end:
             line = self._readline()
-            if line:
-                # print(f"[READY?] {line}")
+            if not line:
                 break
         # READY 미수신이어도 이후 프로토콜 동작에 문제 없으면 패스.
         # 필요시 위 조건 강화 가능.
@@ -165,7 +168,34 @@ class ArduinoFanLedBridge:
         cols_out = self._swap_b_g(cols) if self.swap_bg else cols
         cmd = f"SETALL {' '.join(map(str, vals))} {' '.join(cols_out)}"
         return self._txrx_expect_prefix(cmd, "ACK:SETALL:")
-
+    
+    def all_off(self) -> str:
+        """
+        팬 5개 0% + LED 4개 OFF. (소프트킬/원격 OFF에 매핑하기 좋음)
+        """
+        return self.set_all([0, 0, 0, 0, 0], ["OFF", "OFF", "OFF", "OFF"])
+    
+    def safe_all_off(self) -> bool:
+        """
+        예외 발생 시 False만 반환(메인 루프가 죽지 않게).
+        """
+        try:
+            self.all_off()
+            return True
+        except Exception as e:
+            print(f"[ArduinoBridge][Warn] all_off 실패: {e}")
+            return False
+    
+    def set_tsv(self, values: Sequence[float]) -> str:
+        """
+        (선택) TSV 값 4개를 전송. 아두이노 펌웨어가 'SETT'를 지원할 때만 사용.
+        값은 소수 2자리로 전송. 기대 ACK: 'ACK:SETT:...'
+        """
+        self._require_conn()
+        vals = [float(v) for v in (list(values) + [0, 0, 0, 0])[:4]]
+        cmd = "SETT " + " ".join(f"{v:.2f}" for v in vals)
+        return self._txrx_expect_prefix(cmd, "ACK:SETT:")
+    
     def get_state(self) -> dict:
         """
         아두이노 상태 조회.
@@ -316,17 +346,18 @@ def _parse_four_colors(s: str) -> Optional[List[str]]:
 
 def main():
     try:
-        bridge = ArduinoFanLedBridge(swap_bg=True)  # 하드웨어 B/G 뒤집힘 보정
+        bridge = ArduinoFanLedBridge(swap_bg=True)
         bridge.connect()
     except Exception as e:
         print(f"[ERR] 연결 실패: {e}")
         sys.exit(2)
 
     print(f"✅ 연결됨: {bridge.port}")
-    print("명령: fans / leds / all / get / quit")
+    print("명령: fans / leds / all / off / get / quit")
     print("  fans  → 5개 듀티 (예: 100 80 70 50 100)")
     print("  leds  → 4개 색상 (예: R B G W | OFF 허용)  # 내부 B↔G 보정")
     print("  all   → 팬+LED 동시")
+    print("  off   → 팬 전부 0, LED 전부 OFF (soft-kill 테스트용)")
     print("  get   → 상태 조회")
 
     try:
@@ -379,6 +410,12 @@ def main():
                 except Exception as e:
                     print(f"[ERR] {e}")
 
+            elif cmd == "off":
+                try:
+                    print(bridge.all_off())
+                except Exception as e:
+                    print(f"[ERR] {e}")
+
             elif cmd == "get":
                 try:
                     st = bridge.get_state()
@@ -390,7 +427,7 @@ def main():
                 continue
 
             else:
-                print("알 수 없는 명령입니다. fans / leds / all / get / quit")
+                print("알 수 없는 명령입니다. fans / leds / all / off / get / quit")
 
     finally:
         bridge.close()
