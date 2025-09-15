@@ -217,7 +217,7 @@ sudo usermod -aG dialout $USER && newgrp dialout
 | BTS7960 L\_EN / L\_PWM | **GPIO 23** / **GPIO 24** | L\_PWM는 항상 LOW                        |
 | SoftKill 버튼 입력      | **GPIO 10**               | active_low 옵션 지원                       |
 | SoftKill LED (R/G)     | **GPIO 09** / **GPIO 11** | led_active_high 옵션 지원                 |
-| PCA9685 /OE 제어       | **GPIO 22**               | 활성화 시 전체 채널 Enable/Disable          |
+| PCA9685 / OE 제어       | **GPIO 22**               | 활성화 시 전체 채널 Enable/Disable          |
 | 3.3 V 로직               | —                         | PCA9685 VCC(로직)                       |
 | 5 V(서보)                | —                         | PCA9685 **V+** (외부 5 V, 1N5819 직렬 권장) |
 | 12 V(펠티어)              | —                         | BTS7960 VMOTOR, 입력에 470 µF//0.1 µF    |
